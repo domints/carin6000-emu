@@ -12,3 +12,6 @@
 @source:philips/carin.cpp
 carin
 carin0109
+
+@source:daytona/dvd90.cpp
+opel_dvd90
