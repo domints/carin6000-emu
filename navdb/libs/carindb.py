@@ -30,6 +30,16 @@ def lat(v):
     return v * GPS_UNIT
 
 
+def x_units(deg_long):
+    """Degrees longitude -> GPS units (inverse of lon())."""
+    return round((deg_long + 30) / GPS_UNIT)
+
+
+def y_units(deg_lat):
+    """Degrees latitude -> GPS units (inverse of lat())."""
+    return round(deg_lat / GPS_UNIT)
+
+
 class BlockFile:
     """DB_0 (+ its DB_1 sibling) as one stream of logical blocks of a fixed size (newer disc layout,
     docs/newer_disc_format.md §2). Logical block numbering continues across DB_1, which resumes at
@@ -64,8 +74,23 @@ class BlockFile:
         return bytes(self.block)             # the DB_0 gap, or past the end of the database
 
     def read_blocks(self, blk, count):
-        """`count` logical blocks from `blk`, crossing the DB_0 / gap / DB_1 transitions."""
-        return b"".join(self.read_block(b) for b in range(blk, blk + count))
+        """`count` logical blocks from `blk`, crossing the DB_0 / gap / DB_1 transitions; one file
+        read per source run instead of one per block."""
+        out, end = [], blk + count
+        while blk < end:
+            if blk < self.blocks0:
+                run = min(end, self.blocks0) - blk
+                self.f0.seek(blk * self.block)
+                out.append(_pad(self.f0.read(run * self.block), run * self.block))
+            elif blk < self.first1 or self.f1 is None:
+                run = min(end, self.first1 if self.f1 is not None else end) - blk
+                out.append(bytes(run * self.block))
+            else:
+                run = end - blk
+                self.f1.seek((blk - self.first1) * self.block)
+                out.append(_pad(self.f1.read(run * self.block), run * self.block))
+            blk += run
+        return b"".join(out)
 
     def close(self):
         self.f0.close()
