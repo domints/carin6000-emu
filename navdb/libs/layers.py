@@ -31,7 +31,7 @@ import struct
 from .carindb import (GPS_UNIT, HN_NONE, POINT_STEP, TEXT_TABLES, UnitCache, block_size, cstring,
                       lat, lon, read_blocks, read_unit, units, x_units, y_units)
 from .spindex import Index
-from .unpack import Unpacker
+from .unpack import Unpacker, zlib_unit
 
 ROUTING_LEVELS = ((1, 0), (0x1E, 1), (3, 2), (2, 3))
 NO_TABLE = ((0, 0), (0, 0), (0, 0))
@@ -128,7 +128,13 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
         hn_unit, = struct.unpack_from(">I", d, 0x54) if level == 0 else (0,)
         if hn_unit:
             hu = read_unit(f, hn_unit)
-            if len(hu) < 0x10:             # defensive: pointer into a gap / outside the database
+            try:
+                if hu[6] == 2:             # table a on the newer disc: zlib units
+                    hu = zlib_unit(hu, block_size(f))
+            except ValueError:
+                hu = b""
+            # +12 = the parcel it belongs to; anything else: a pointer into a gap / garbage
+            if len(hu) < 0x10 or struct.unpack_from(">I", hu, 12)[0] >> 8 != b:
                 hn_unit = 0
         hn_n = (len(hu) - 0x10) // 10 if hn_unit else 0    # one 10 B record per segment
         for i in range(seg_n):
