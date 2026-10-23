@@ -50,6 +50,9 @@
 
 #include "w_wad.h"
 #include "z_zone.h"
+#ifdef CARMINAT
+#include "carminat.h"
+#endif
 
 #ifdef __MACOSX__
 #include <CoreFoundation/CFUserNotification.h>
@@ -156,13 +159,10 @@ byte *I_ZoneBase (int *size)
     }
 
 #ifdef CARMINAT
-    // CARMINAT: the zone is the 2 MB Extension RAM block the loader took.
-    {
-        extern struct carminat_env { unsigned char *zone; unsigned zone_size; } *carminat_env;
-        zonemem = carminat_env->zone;
-        *size = carminat_env->zone_size;
-        (void) default_ram; (void) min_ram;
-    }
+    // CARMINAT: the zone is the RAM the loader took; Z_Init adds the regions after the first.
+    zonemem = carminat_env->zone[0].base;
+    *size = carminat_env->zone[0].size;
+    (void) default_ram; (void) min_ram;
 #else
     zonemem = AutoAllocMemory(size, default_ram, min_ram);
 #endif

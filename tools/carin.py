@@ -188,6 +188,11 @@ def mame_command(state, log_dir, cdrom, system):
     ] + (["-cdrom", str(cdrom)] if cdrom else [])
 
 
+def ram_options(args):
+    """--no-ext-ram: a unit without the 2 MB Extension RAM at 0xA00000 (the RAM slot set to 2m)."""
+    return ["-ram", "2m"] if args.no_ext_ram else []
+
+
 def speed_options(args):
     """Full speed by default; --realtime throttles to the real machine's speed."""
     return [] if args.realtime else ["-nothrottle"]
@@ -249,7 +254,7 @@ def cmd_run(args):
     log_dir = new_log_dir("run", state)
     cmd = mame_command(state, log_dir, cd_image(args), args.system)
     cmd += ["-seconds_to_run", str(args.seconds), "-video", "none", "-sound", "none"]
-    cmd += speed_options(args)
+    cmd += ram_options(args) + speed_options(args)
     env = trace_env(args)
     if probe_env(args, env):
         cmd += ["-autoboot_script", str(ROOT / "tools" / "carin_probe.lua")]
@@ -280,7 +285,7 @@ def cmd_gui(args):
     # -ui_active: the console has an emulated keyboard, which would otherwise take every key
     # (Tab included) until the UI toggle key (Scroll Lock) is pressed.
     cmd += ["-window", "-nomaximize", "-view", "Navigation, panel and console", "-ui_active"]
-    cmd += speed_options(args)
+    cmd += ram_options(args) + speed_options(args)
     if args.debug:
         cmd += ["-debug"]
     cmd += args.mame_args
@@ -322,6 +327,8 @@ def add_state_options(p):
                       help="replace the state with the snapshot in DIR (your own seed), then start")
     g.add_argument("--save-to", metavar="DIR", help="copy the state to DIR after the run")
     g.add_argument("--hw", choices=sorted(SYSTEMS), help="hardware variant (default: the state's, else 0209)")
+    g.add_argument("--no-ext-ram", action="store_true",
+                   help="no Extension RAM at 0xA00000 (2 MB less), like a real 0209 unit; maps need it")
     c = p.add_argument_group("disc").add_mutually_exclusive_group()
     c.add_argument("--cd", metavar="PATH",
                    help=f"disc in the drive: a name from cd/ (NAME.chd or NAME.cue) or a path to an image "

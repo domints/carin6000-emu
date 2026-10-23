@@ -39,7 +39,8 @@ class Database:
         self.ptr = {}
         self.blocks = {}                # block number 1-4 -> build(resolve), replaces the template
         self.country_roots = None       # number of root nodes of the country trie (block 3)
-        self.country_numbers = None     # countries kept in block 2's per-country slot (None = all)
+        self.country_numbers = None     # block 2's per-country slot: {our number: template number
+                                        # whose settings are copied} (None = the template's)
 
     def add(self, table):
         self.tables[table.tid] = table
@@ -115,12 +116,13 @@ class Database:
         w = lambda o: struct.unpack_from(">H", d, o)[0]
         s1, s2, n2 = w(12), w(16), w(18)
         old0 = self.template_dir[0][1]
-        if struct.unpack_from(">I", d, s1)[0] == (old0[0] << 8 | old0[1]) and 0 in self.tables:
-            struct.pack_into(">I", d, s1, self.ptr[self.tables[0].units[0].key])
+        if struct.unpack_from(">I", d, s1)[0] == (old0[0] << 8 | old0[1]):
+            t0 = self.tables.get(0)
+            struct.pack_into(">I", d, s1, self.ptr[t0.units[0].key] if t0 and t0.units else 0)
         # slot 2: 22-byte settings per country, by country number
         if self.country_numbers is not None:
-            keep = [bytes(d[s2 + 22 * i:s2 + 22 * i + 22]) for i in range(n2)
-                    if w(s2 + 22 * i) in self.country_numbers]
+            old = {w(s2 + 22 * i): bytes(d[s2 + 22 * i:s2 + 22 * i + 22]) for i in range(n2)}
+            keep = [struct.pack(">H", ours) + old[src][2:] for ours, src in sorted(self.country_numbers.items())]
             for i, rec in enumerate(keep):
                 d[s2 + 22 * i:s2 + 22 * i + 22] = rec
             struct.pack_into(">H", d, 18, len(keep))
@@ -148,25 +150,3 @@ class Database:
                         raise ValueError(f"unit {u.key} changed size")
                     f.write(data)
         return self.total
-
-
-def copied_table(template, tid, grid=None, box_at=0x20):
-    """A table copied unit by unit from the original (background, TMC): each unit gets its new
-    pointer at +0; pointers between units of the table are moved too (TMC next / previous at
-    +0x0c / +0x10, table 0's list of table 18 units). Returns (Table, {old pointer: key})."""
-    from .carindb import read_unit, units
-    with open(template, "rb") as f:
-        tdir = table_directory(f)
-        (_, _), (data, _), (end, _) = tdir[tid]
-        raw = [((b << 8) | n, read_unit(f, (b << 8) | n)) for b, n, _ in units(f, data, end)]
-    keys = {old: ("copy", tid, k) for k, (old, _) in enumerate(raw)}
-    return raw, keys
-
-
-def relocate(data, own, links, resolve):
-    """data with +0 = own pointer and the u32 at each offset in links mapped through resolve."""
-    d = bytearray(data)
-    struct.pack_into(">I", d, 0, own)
-    for o, key in links:
-        struct.pack_into(">I", d, o, resolve(key) if key else 0)
-    return bytes(d)

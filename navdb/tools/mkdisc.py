@@ -27,9 +27,12 @@ ABSTRACT = """This medium contains a digital road map database for the CARiN- an
 The road network, addresses and places come from OpenStreetMap (https://www.openstreetmap.org),
 converted with the carin6000-emu navdb encoder. Not for safety-relevant navigation.
 
+Content              :{content}
 Tool                 :5001
 Date                 :{date}
 CD number            :21435
+Converted            :{when}
+Converted on         :{host}
 """
 COPYRIGHT = """COPYRIGHT
 
@@ -39,6 +42,15 @@ https://www.openstreetmap.org/copyright.
 Database format by Continental Automotive GmbH / Philips CARiN; this disc was written by the
 carin6000-emu navdb encoder for hobby use with the user's own device.
 """
+
+
+def conversion_info(path):
+    """Conversion time and host from the database's info block (block 1), as the encoder wrote them."""
+    with open(path, "rb") as f:
+        f.seek(2048)
+        text = f.read(2048).decode("latin1")
+    get = lambda key: next((l.split(":", 1)[1].strip() for l in text.splitlines() if key in l), "?")
+    return get("conversion date"), get("conversion by"), get("content:")
 
 
 def bcd(v):
@@ -64,25 +76,19 @@ def dir_entries(sector):
         p += sector[p]
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/enc/carindb")
-    ap.add_argument("-o", "--output", type=Path, default=ROOT / "cd/carin_osm.img")
-    ap.add_argument("--template", type=Path, default=ROOT / "cd/carin_maps_pl_2012_2013.img")
-    ap.add_argument("--chd", action="store_true", help="also make a .chd for MAME (chdman)")
-    args = ap.parse_args()
-    for path in (args.carindb, args.template):
-        if not path.is_file():
-            ap.error(f"{path} not found")
-    db = args.carindb.read_bytes()
-    tpl = open(args.template, "rb")
+def build(carindb, output, template, chd=False, log=print):
+    """Writes output (.img) and its .cue (and .chd with chd) for the database file carindb."""
+    db = Path(carindb).read_bytes()
+    output = Path(output)
+    tpl = open(template, "rb")
     head = []
     for lba in range(DATA_LBA):
         tpl.seek(lba * SECTOR + 24)
         head.append(bytearray(tpl.read(USER)))
     total = DATA_LBA + -(-len(db) // USER)
     today = datetime.date.today()
-    texts = {"ABSTRACT": ABSTRACT.format(date=today.isoformat()).encode("latin1"),
+    when, host, content = conversion_info(carindb)
+    texts = {"ABSTRACT": ABSTRACT.format(date=today.isoformat(), when=when, host=host, content=content).encode("latin1"),
              "COPYRIGH": COPYRIGHT.encode("latin1")}
 
     pvd = head[16]
@@ -110,20 +116,35 @@ def main():
         d[813:830] = stamp                        # creation and modification date
         d[830:847] = stamp
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "wb") as out:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "wb") as out:
         for lba, data in enumerate(head):
             out.write(raw_sector(lba, bytes(data)))
         for k in range(total - DATA_LBA):
             out.write(raw_sector(DATA_LBA + k, db[k * USER:(k + 1) * USER]))
-    cue = args.output.with_suffix(".cue")
-    cue.write_text(f'FILE "{args.output.name}" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n')
-    print(f"wrote {args.output} ({total} sectors) and {cue.name}")
-    if args.chd:
-        chd = args.output.with_suffix(".chd")
-        subprocess.run(["chdman", "createcd", "-f", "-i", str(cue), "-o", str(chd)], check=True,
-                       stdout=subprocess.DEVNULL)
-        print(f"wrote {chd}")
+    cue = output.with_suffix(".cue")
+    cue.write_text(f'FILE "{output.name}" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n')
+    log(f"disc: {output} ({total} sectors, {total * SECTOR / 1e6:.0f} MB) and {cue.name}")
+    if total > 333000:
+        log("warning: more than a 74-minute CD-R holds (333 000 sectors)")
+    if chd:
+        path = output.with_suffix(".chd")
+        subprocess.run(["chdman", "createcd", "-f", "-i", str(cue), "-o", str(path)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"disc: {path}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
+    ap.add_argument("-o", "--output", type=Path, default=ROOT / "cd/carin_osm.img")
+    ap.add_argument("--template", type=Path, default=ROOT / "cd/carin_maps_pl_2012_2013.img")
+    ap.add_argument("--chd", action="store_true", help="also make a .chd for MAME (chdman)")
+    args = ap.parse_args()
+    for path in (args.carindb, args.template):
+        if not path.is_file():
+            ap.error(f"{path} not found")
+    build(args.carindb, args.output, args.template, args.chd)
 
 
 if __name__ == "__main__":

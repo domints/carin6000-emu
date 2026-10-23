@@ -18,6 +18,7 @@ Czyli róbta co chceta to tylko AI slop.
 | `roms/carin0109/` | `bootrom_0109.bin` (bootrom 1.21 z płyty NAV_SW, `Mk2IC/0109`) i `nv.img` (seed NV z identyfikatorem `Mk2IC0109`). |
 | `cd/` | Obrazy płyt, nie są w repo (`.gitignore`): oprogramowanie `carin_nav_sw` i mapy, np. `carin_maps_pl_2012_2013` (`.chd` albo `.cue` + `.img`). Opis w [cd/README.md](cd/README.md). |
 | `tools/` | `carin.py` (budowanie i uruchamianie) oraz narzędzia analityczne. |
+| `navdb/` | Mapy: dekoder oryginalnej bazy map do GeoPackage (QGIS) i enkoder OpenStreetMap → własna płyta z mapą. Opis w [navdb/README.md](navdb/README.md), format w [navdb/docs/format.md](navdb/docs/format.md). |
 | `cfw/` | Własne oprogramowanie na płytę (custom firmware): [`cfw/poc`](cfw/poc/README.md) (hello world, przyciski, π, benchmark RAM/wideo na prawdziwy sprzęt) i [`cfw/carminat_doom`](cfw/carminat_doom/README.md) (port Dooma, w budowie). Binarki (`build/`, moduły, obrazy, WAD-y) są poza gitem. |
 | `docs/` | Notatki z reverse engineeringu. |
 | `state/` | Stany maszyny (NV + flash). Ignorowany przez gita. |
@@ -119,6 +120,7 @@ tools/carin.py gui --state hw0109 --cd carin_maps_pl_2012_2013
 | `--seed` | wyczyść stan: pusty flash, NV z `nv.img` |
 | `--load KATALOG` | wczytaj stan z katalogu (własny seed) |
 | `--save-to KATALOG` | po zakończeniu skopiuj stan do katalogu |
+| `--no-ext-ram` | bez 2 MB Extension RAM pod 0xA00000 (`-ram 2m`), jak prawdziwe urządzenie 0209; mapy z płyty go potrzebują |
 
 ## Bez okna (headless)
 
@@ -181,6 +183,18 @@ cd cd && cdrdao write --device /dev/sr0 carminat_doom.cue
 ```
 
 Na prawdziwym sprzęcie warto najpierw wypalić PoC i odczytać benchmark z paska tytułu. Obrazów płyt nie publikuje się, bo zawierają OS-9 i oprogramowanie Philipsa/Renault. Każdy buduje je z własnego obrazu NAV_SW.
+
+## Mapy z OpenStreetMap (navdb)
+
+Własną płytę z mapą (jeden kraj) robi się z danych OSM. Enkoder sam je pobiera z Geofabrik:
+
+```bash
+python3 navdb/encoder.py warszawa             # drogi, routing, adresy, POI, tło -> cd/carin_warszawa.img/.cue
+python3 navdb/encoder.py polska               # cała Polska (także: serbia, województwa)
+tools/carin.py gui --state installed --cd carin_warszawa
+```
+
+Regiony, opcje, ograniczenia (na razie bez zakazów skrętu) i weryfikacja: [navdb/README.md](navdb/README.md).
 
 ## Logi
 

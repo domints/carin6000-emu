@@ -19,6 +19,7 @@ from .osmnet import CLASS_DEFAULTS, DEFAULTS, metres
 ORIGIN = (-34998272, -59092992)    # grid origin of every index (block 2 directory), GPS units
 EXTENT = 1 << 29
 MIN_SIZE = 1 << 15                 # smallest parcel side in the original (32768 units)
+MAX_SIZE = 1 << 21                 # largest level 0 parcel side (points are u16 steps of 64)
 MAX_BYTES = 12000                  # estimated parcel size limit (units are at most 8 blocks)
 SEG = 32                           # level 0 segment record (type 0x08)
 
@@ -30,7 +31,7 @@ def heading(p, q):
     return round(math.degrees(a) % 360 * 256 / 360) & 0xFF
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, slots=True)
 class Box:
     x: int
     y: int
@@ -62,7 +63,7 @@ def tile(edges, bbox_gps):
     load = [(e.points(), 48 + 6 * len(e.shape) + 2 * len(e.road.name or "")) for e in edges]
 
     def split(box, items):
-        if box.size > MIN_SIZE and sum(c for _, c in items) > MAX_BYTES:
+        if box.size > MAX_SIZE or (box.size > MIN_SIZE and sum(c for _, c in items) > MAX_BYTES):
             h = box.size // 2
             leaves = []
             for dx in (0, h):
@@ -100,16 +101,17 @@ class Grid:
         return self.index.get(key)
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, slots=True)
 class Piece:
     """A part of an edge inside one parcel."""
     points: list
     road: object
     length: int
     border: tuple = (False, False)     # start / end is an edge point
+    hn: tuple = None                   # house numbers (osmaddr.assign)
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, slots=True)
 class Parcel:
     box: Box
     level: int = 0
@@ -119,6 +121,7 @@ class Parcel:
     children: list = field(default_factory=list)
     times: tuple = (0, 0, 0)                         # header 0x60/0x64/0x68
     offsets: dict = field(default_factory=dict)      # point -> offset of its record (after layout)
+    seg_base: int = 0                                # offset of slot 4 (after layout)
 
 
 def _nudge(p, box):

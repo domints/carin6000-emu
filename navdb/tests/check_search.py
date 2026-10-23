@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Walks the address search of a carindb the way the device does: country (block 4) -> city trie
-(e) -> city (d) -> street trie (10) -> street entry (f) -> items -> parcel segments, and checks
-every step (docs/format.md section 7).
+(e) -> city (d) -> street trie (10) -> street entry (f) -> items -> parcel segments, and the
+POI: city and country category lists -> trie (12) -> name entries and details (11) -> access
+segment; table 7 points -> their name entries. Checks every step (docs/format.md sections 7, 8).
 
-usage: check_search.py [carindb] [--country pl] [--cities N]   (default: the encoder output)
+usage: check_search.py [carindb] [--country pl] [--cities N]   (default: temp/navdb/warszawa/carindb)
 """
 import argparse
 import struct
@@ -12,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from libs.carindb import TEXT_TABLES, cstring, header_info, read_unit
+from libs.carindb import TEXT_TABLES, cstring, header_info, read_unit, table_directory, units as table_units
 from libs.unpack import Unpacker
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,8 +25,8 @@ def w(d, o):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/enc/carindb")
-    p.add_argument("--country", default="pl")
+    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
+    p.add_argument("--country", help="ISO code (default: the first country)")
     p.add_argument("--cities", type=int, default=0, help="check only the first N cities (0 = all)")
     args = p.parse_args()
     f = open(args.carindb, "rb")
@@ -46,7 +47,28 @@ def main():
         return parcels[ptr]
 
     res = {k: Counter() for k in ("block 0 country trie -> countries", "trie prefix", "city segment is a segment", "street item -> segments of that street",
-                                  "item numbers in the segments' ranges")}
+                                  "item numbers in the segments' ranges", "poi list -> names of that category",
+                                  "poi detail in its unit", "poi access -> a segment", "poi point -> its name entry")}
+
+    def poi_list(d, off, count):
+        """Category records (12 B) -> trie -> table 11 entries; checks the details."""
+        for k in range(count):
+            t12, o12, n12, cat, _ = struct.unpack_from(">IHHHH", d, off + 12 * k)
+            names = []
+            walk(t12, o12, n12, "", names)
+            res["poi list -> names of that category"][bool(names)] += 1
+            for g, entry, _ in names:
+                rec = entry[3]
+                ok = 0x30 <= rec and rec + 40 <= len(g)
+                res["poi detail in its unit"][ok] += 1
+                if not ok:
+                    continue
+                a_off, a_n = struct.unpack_from(">HH", g, rec + 8)
+                for a in range(a_n):
+                    pp, so, side = struct.unpack_from(">IHH", g, a_off + 8 * a)
+                    dd = parcel(pp)
+                    s4, c4 = w(dd, 0x18), w(dd, 0x1a)
+                    res["poi access -> a segment"][s4 <= so < s4 + 32 * c4 and (so - s4) % 32 == 0 and side < 2] += 1
 
     def walk(ptr, off, count, prefix, out):
         t = unit(ptr)
@@ -76,8 +98,10 @@ def main():
     print("countries:", ", ".join(name for _, _, name in countries))
     for b4, entry, _ in countries:
         rec = entry[3]
+        args.country = args.country or b4[rec + 46:rec + 48].decode()
         if b4[rec + 46:rec + 48].decode() != args.country:
             continue
+        poi_list(b4, w(b4, rec + 24), w(b4, rec + 26))
         e_ptr, e_off, e_n = struct.unpack_from(">IHH", b4, rec)
         cities = []
         walk(e_ptr, e_off, e_n, "", cities)
@@ -86,7 +110,8 @@ def main():
             if args.cities and k >= args.cities:
                 break
             r = entry[3]
-            t10, o10, n10, _, _, cp, co = struct.unpack_from(">IHHHHIH", g, r)
+            t10, o10, n10, s3, n3, cp, co = struct.unpack_from(">IHHHHIH", g, r)
+            poi_list(g, s3, n3)
             if cp:
                 d = parcel(cp)
                 s4, c4 = w(d, 0x18), w(d, 0x1a)
@@ -111,6 +136,20 @@ def main():
                         nm = cstring(d, w(d, prec)) if prec and ts else None
                         ok &= nm is not None and set(nm.split()) == words
                     res["street item -> segments of that street"][ok] += 1
+    # table 7: every point names an entry whose detail lies at the point
+    tables = table_directory(f)
+    (_, _), (first, _), (last, _) = tables[7]
+    for b, length, _ in table_units(f, first, last) if first else ():
+        f.seek(b * 2048)
+        u = f.read(length * 2048)
+        off, count = struct.unpack_from(">HH", u, 8)
+        x0, y0 = struct.unpack_from(">ii", u, 0x10)
+        for i in range(count):
+            ptr, noff, x, y = struct.unpack_from(">IHHH", u, off + 28 * i)
+            g = unit(ptr)
+            rec = w(g, noff + 6)
+            px, py = struct.unpack_from(">ii", g, rec)
+            res["poi point -> its name entry"][abs(x0 + 64 * x - px) < 128 and abs(y0 + 64 * y - py) < 128] += 1
     failed = 0
     for name, c in res.items():
         if c:

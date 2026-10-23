@@ -174,7 +174,7 @@ def overview_qml():
 <qgis version="3.34" styleCategories="AllStyleCategories">
   <renderer-v2 type="RuleRenderer" symbollevels="0">
     <rules key="root">
-      <rule key="o0" symbol="0" filter="&quot;level&quot; = 0" scalemindenom="2000000" scalemaxdenom="4000000"/>
+      <rule key="o0" symbol="0" filter="&quot;level&quot; = 0 AND &quot;type&quot; >= 104" scalemindenom="2000000" scalemaxdenom="4000000"/>
       <rule key="o1" symbol="0" filter="&quot;level&quot; = 1" scalemindenom="4000000" scalemaxdenom="10000000"/>
       <rule key="o2" symbol="0" filter="&quot;level&quot; = 2" scalemindenom="10000000" scalemaxdenom="20000000"/>
       <rule key="o3" symbol="0" filter="&quot;level&quot; = 3" scalemindenom="20000000" scalemaxdenom="40000000"/>

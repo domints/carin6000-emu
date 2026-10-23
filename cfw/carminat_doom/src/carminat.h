@@ -19,11 +19,17 @@ struct flat_header {
 /* What the loader hands to Doom's entry point. */
 struct scrlog;
 
+#define ZONE_REGIONS 8
+
 struct carminat_env {
-	unsigned char *zone;		/* the zone heap (Extension RAM, 2 MB) */
-	unsigned zone_size;
+	struct {			/* the zone heap: the RAM blocks the loader could get */
+		unsigned char *base;
+		unsigned size;
+	} zone[ZONE_REGIONS];
+	unsigned zone_count;
 	unsigned char *heap;		/* malloc arena after the image and bss */
-	unsigned char *heap_end;
+	unsigned char *heap_end;	/* also the bottom of the stack */
+	unsigned char *stack_top;
 	volatile unsigned char *fb;	/* frame buffer, 384 x 240, RRRGGGBB */
 	int nav;			/* path of /nav_bus, opened by the loader */
 	const char *wad;		/* WAD path on the disc */
@@ -39,6 +45,10 @@ struct carminat_env {
 /* Doom side: set by crt0 from the loader's argument. */
 extern struct carminat_env *carminat_env;
 
+#define STACK_FILL 0x5a		/* the loader's fill of the stack, to measure its use */
+unsigned carminat_heap_used(void);
+void carminat_log_memory(const char *when);
+
 int os9_open(const char *name, int mode);
 int os9_close(int path);
 int os9_read(int path, void *buf, int count);
@@ -49,6 +59,8 @@ int os9_size(int path);
 int os9_ready(int path);
 int os9_sleep(int ticks);
 int os9_srqmem(unsigned size, void **block);
+int os9_srtmem(unsigned size, void *block);
+int os9_gblkmp(void *map, unsigned size, unsigned *out);
 unsigned os9_ticks(unsigned *rate);
 void os9_exit(int status) __attribute__((noreturn));
 

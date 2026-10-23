@@ -2,7 +2,7 @@
 """Checks the structural rules of a carindb (the ones found on the original, docs/format.md) on any
 database, the original or one the encoder wrote. Every rule prints passed / failed counts.
 
-usage: check_db.py [carindb] [--every N]   (default: temp/navdb/enc/carindb, every parcel)
+usage: check_db.py [carindb] [--every N]   (default: temp/navdb/warszawa/carindb, every parcel)
 """
 import argparse
 import struct
@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from libs import parcelfmt, spindex
+from libs import bgfmt, parcelfmt, spindex
 from libs.carindb import TEXT_TABLES, header_info, read_unit, table_directory, units
 from libs.unpack import Unpacker
 
@@ -149,7 +149,7 @@ def check_parcel(d, ptr, level, sizes, get, res):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/enc/carindb")
+    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
     p.add_argument("--every", type=int, default=1, help="check every Nth parcel")
     args = p.parse_args()
     f = open(args.carindb, "rb")
@@ -177,7 +177,8 @@ def main():
                                   "class index (slot 3)", "segment ends are nodes", "node used by a segment",
                                   "node ring = degree", "node type by degree", "edge point reciprocal",
                                   "slot 9 = edge point neighbours", "shape ranges increase",
-                                  "spatial index -> covering unit")}
+                                  "spatial index -> covering unit", "background layout round trip",
+                                  "background groups and end records")}
     for tid, level in LEVELS:
         (a, _), (b, _), (c, _) = tables.get(tid, ((0, 0), (0, 0), (0, 0)))
         if not b:
@@ -194,6 +195,26 @@ def main():
                 x0, y0, x1, y1 = struct.unpack_from(">4i", d, 0x44)
                 cx, cy = x + size // 2, y + size // 2
                 res["spatial index -> covering unit"][x0 <= cx < x1 and y0 <= cy < y1] += 1
+    # background: layout, groups and end records, spatial index
+    for tid in (6, 0x16, 0x15, 0x1C, 0x14, 0x1D):
+        (a, _), (b, _), (c, _) = tables.get(tid, ((0, 0), (0, 0), (0, 0)))
+        if not b:
+            print(f"background table {tid:x} empty")
+            continue
+        for blk, length, head in units(f, b, c):
+            d = get((blk << 8) | length)
+            res["background layout round trip"][bgfmt.write(bgfmt.read(d), len(d) // 2048) == d] += 1
+            g, gc = w(d, 8), w(d, 10)
+            o1, c1, o2, c2 = w(d, 12), w(d, 14), w(d, 16), w(d, 18)
+            end = (o2 + 16 * c2) if o2 else (o1 + 20 * c1)
+            groups = [(d[g + 4 * i], d[g + 4 * i + 1], w(d, g + 4 * i + 2)) for i in range(gc + 1)]
+            ok = groups[-1][2] == end and all(groups[i][2] <= groups[i + 1][2] for i in range(gc))
+            res["background groups and end records"][ok] += 1
+        if a:
+            for x, y, size, ptr in spindex.cells(f, a, b):
+                d = get(ptr)
+                x0, y0, x1, y1 = struct.unpack_from(">4i", d, 0x20)
+                res["spatial index -> covering unit"][x0 <= x + size // 2 < x1 and y0 <= y + size // 2 < y1] += 1
     failed = 0
     for name, c in res.items():
         if c:

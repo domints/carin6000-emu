@@ -152,9 +152,16 @@ int isatty(int fd)
 	return fd < FD_BASE;
 }
 
+static unsigned char *brk;
+
+/* Bytes of the malloc arena handed out so far (malloc never gives memory back to sbrk). */
+unsigned carminat_heap_used(void)
+{
+	return brk ? (unsigned)(brk - carminat_env->heap) : 0;
+}
+
 void *sbrk(ptrdiff_t increment)
 {
-	static unsigned char *brk;
 	if (!brk)
 		brk = carminat_env->heap;
 	if (brk + increment > carminat_env->heap_end) {

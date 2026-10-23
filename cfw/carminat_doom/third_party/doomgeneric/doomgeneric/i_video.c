@@ -287,7 +287,15 @@ void I_InitGraphics (void)
 
 
     /* Allocate screen to draw to */
+#ifdef CARMINAT
+	// CARMINAT: in the bss, not the zone: the zone may be a few small RAM blocks without 64 KB in one piece.
+	{
+		static byte screen[SCREENWIDTH * SCREENHEIGHT];
+		I_VideoBuffer = screen;
+	}
+#else
 	I_VideoBuffer = (byte*)Z_Malloc (SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);  // For DOOM to draw on
+#endif
 
 	screenvisible = true;
 

@@ -61,6 +61,9 @@ void    Z_ChangeTag2 (void *ptr, int tag, char *file, int line);
 void    Z_ChangeUser(void *ptr, void **user);
 int     Z_FreeMemory (void);
 unsigned int Z_ZoneSize(void);
+#ifdef CARMINAT
+void Z_Usage(int *fixed, int *cache, int *free);
+#endif
 
 //
 // This is used to get the local FILE:LINE info from CPP

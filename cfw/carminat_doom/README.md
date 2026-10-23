@@ -22,7 +22,9 @@ Do wypalenia jak PoC: `cd cd && cdrdao write --device /dev/sr0 carminat_doom.cue
    - `il` (instalator) to zaślepka z PoC, która tylko śpi;
    - obraz Dooma i WAD są dopisane na koniec płyty jako nowe sektory, a wpisy katalogu `language_cd/d_f.csf` i `e_f.csf` wskazują na nie (LBN i rozmiar, plus rozmiar woluminu w etykiecie). System plików CD-i zostaje bez przebudowy.
 2. **Program ładujący** (`loader/loader.c`, moduł OS-9 bez zmiennych globalnych, jak PoC):
-   - bierze 2 MB Extension RAM na strefę Dooma i blok z RAM-u systemowego na obraz, bss, stertę malloc (160 KB) i stos (64 KB). Nigdy nie prosi o „największy blok”: lista wolnej pamięci pokazuje też RAM wideo i pamięć wspólną slave'a;
+   - najpierw bierze blok na obraz, bss, stertę malloc (64 KB) i stos (32 KB), potem resztę wolnej pamięci na strefę Dooma, w maks. 8 blokach: Extension RAM (2 MB, jeśli jest), Development RAM VSC (0x680000, 512 KB), resztki RAM-u systemowego i obszaru USW. Zostawia 48 KB dla systemu. Bloki z RAM-u wideo i pamięci wspólnej slave'a, które lista wolnej pamięci też pokazuje, są trzymane do końca alokacji i oddawane, nigdy używane. Szybki RAM systemowy idzie na początek strefy, więc dane poziomu trafiają tam, a nie do wolniejszej pamięci VSC;
+   - prawdziwe urządzenie 0209 nie ma Extension RAM (pierwsza wersja padała z `no RAM for the zone, error 0ED`, czyli E$NoRAM). Wolne było: 952K RAM-u systemowego, 512K Development RAM, 64K USW. W emulatorze odtwarza to `tools/carin.py ... --no-ext-ram`;
+   - przy strefie z kilku bloków albo przy błędzie wypisuje mapę wolnej pamięci sprzed swoich alokacji (`F$GBlkMp`; w trakcie nie można, bo przy całkowicie zajętym obszarze pamięci to wywołanie wisi). Strefa mniejsza niż 512 KB to błąd;
    - wczytuje `/cd/language_cd/d_f.csf`, nakłada relokacje R_68K_32, zeruje bss i skacze do Dooma na nowym stosie.
 3. **Obraz Dooma** (`tools/mkflat.py`): ELF zlinkowany od adresu 0 (`doom.ld`, `--emit-relocs`), przerobiony na płaski obraz z tabelą relokacji. Doom to zwykłe C ze zmiennymi globalnymi i newlib.
 4. **Wywołania systemowe** (`src/syscalls.c`, `src/os9.S`): pliki to ścieżki OS-9 (tylko odczyt, I$Seek/SS_Size), konsola to UART A, `sbrk` daje stertę od programu ładującego.
@@ -32,7 +34,8 @@ Do wypalenia jak PoC: `cd cd && cdrdao write --device /dev/sr0 carminat_doom.cue
 6. **WAD** (`tools/wadstrip.py`): zostaje jedna mapa (`MAP=E1M1`). Do tego tekstury z jej sidedefów (TEXTURE1 i TEXTURE2 połączone, PNAMES przebudowane), jej flaty i sprite'y wszystkiego, co może się na niej pojawić: lista liczona z tablic stanów silnika (`info.c`, `d_items.c`), z pociskami, upuszczanymi przedmiotami i broniami gracza. Do tego grafika paska, menu i przerywnika. Bez dźwięku, muzyki i dem.
 
 Łatki w silniku (`third_party/doomgeneric`) są oznaczone `CARMINAT`:
-- strefa z bloku od programu ładującego;
+- strefa z bloków od programu ładującego (`Z_Init` łączy je w jedną listę; między regionami stoi zajęty blok-płot, żeby zwalnianie nie sklejało bloków, które się nie stykają);
+- bufor ekranu 320×200 w bss zamiast w strefie (strefa z małych bloków może nie mieć 64 KB w jednym kawałku);
 - kolory w `R_InitColormaps`, `I_SetPalette`, `V_DrawPatch*`, automapie i `R_FillBackScreen`;
 - brakujące tekstury przełączników są pomijane;
 - `.csf` liczy się jako WAD;
@@ -50,6 +53,8 @@ Kompilacja z `-msoft-float`, bo 68EC030 nie ma FPU. Makefile odrzuca obraz z ins
 Cały start widać na ekranie, bez kabla do UART-a (`src/scrlog.c`: font 5×7, 64 kolumny, 28 linii, przewijanie z własnej kopii tekstu):
 - program ładujący wypisuje każdy krok: bufor ekranu, strefa, otwarcie obrazu, adres, relokacje, `/nav_bus`. Błąd jest czerwony i program staje na nim;
 - Doom przekierowuje na ekran wszystko, co pisze na konsolę (`W_Init`, `R_Init`…), a `stderr` (np. `I_Error`) zawsze, także w trakcie gry.
+
+Przy READY i co 30 s gry na UART A idzie linia `memory ...`: strefa (stałe dane, cache, wolne), zużycie sterty i najgłębsze użycie stosu (program ładujący wypełnia stos wzorcem). Przy E1M1: stałe ok. 455K, sterta 50K.
 
 Po wczytaniu poziomu pojawia się zielone **READY – PRESS ANY BUTTON**. Gra (zegar, ekran) rusza dopiero po dowolnym przycisku albo obrocie pokrętła. Jeśli coś utknie, ostatnia linia na ekranie pokazuje, gdzie. Wszystko idzie równolegle na UART A.
 

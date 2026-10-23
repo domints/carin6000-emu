@@ -18,6 +18,7 @@
 #include "doomgeneric.h"
 #include "doomkeys.h"
 #include "doomtype.h"
+#include "z_zone.h"
 
 struct carminat_env *carminat_env;
 /* The start is logged on the screen (no serial cable needed) until the player presses a button. */
@@ -220,6 +221,14 @@ void DG_DrawFrame(void)
 		since = now;
 		frames = 0;
 	}
+	/* RAM use on the console every 30 s of play: the peaks of the zone, heap and stack. */
+	static unsigned mem_since;
+	unsigned t = DG_GetTicksMs();
+	if (t - mem_since >= 30000) {
+		if (mem_since)
+			carminat_log_memory("in game");
+		mem_since = t;
+	}
 	/* Release last frame's taps, then read the panel. */
 	while (taps)
 		push_key(0, tap_keys[--taps]);
@@ -256,6 +265,22 @@ void DG_SetWindowTitle(const char *title)
 	(void)title;
 }
 
+/* What Doom holds of its RAM: the zone (fixed = static and level data, cache = purgeable), the
+ * malloc arena and the deepest stack use so far (the loader fills the stack with STACK_FILL). */
+void carminat_log_memory(const char *when)
+{
+	int fixed, cache, free;
+	Z_Usage(&fixed, &cache, &free);
+	const unsigned char *p = carminat_env->heap_end;
+	while (p < carminat_env->stack_top && *p == STACK_FILL)
+		p++;
+	printf("memory %s: zone fixed %dK cache %dK free %dK, heap %uK of %uK, stack %uK of %uK\n", when,
+	       fixed >> 10, cache >> 10, free >> 10, carminat_heap_used() >> 10,
+	       (unsigned)(carminat_env->heap_end - carminat_env->heap) >> 10,
+	       (unsigned)(carminat_env->stack_top - p) >> 10,
+	       (unsigned)(carminat_env->stack_top - carminat_env->heap_end) >> 10);
+}
+
 /* d_main.c D_DoomLoop, just before the game clock starts (CARMINAT patch): the level is loaded;
  * wait for any panel key or knob turn, then hand the screen to the game. */
 void carminat_ready(void)
@@ -263,6 +288,7 @@ void carminat_ready(void)
 	unsigned char f[0x26];
 	carminat_log.color = SCRLOG_GREEN;
 	scrlog_puts(&carminat_log, "\nREADY - PRESS ANY BUTTON\n");
+	carminat_log_memory("at start");
 	printf("ready, waiting for a button\n");
 	for (;;) {
 		if (os9_ready(carminat_env->nav) > 0) {
@@ -282,8 +308,11 @@ int carminat_main(void)
 	argv[2] = (char *)carminat_env->wad;
 	carminat_log = *carminat_env->log;
 	carminat_log_on = 1;
-	printf("Carminat Doom: zone %u KB at %p, heap %u KB\n", carminat_env->zone_size >> 10,
-	       carminat_env->zone, (unsigned)(carminat_env->heap_end - carminat_env->heap) >> 10);
+	unsigned zone = 0;
+	for (unsigned i = 0; i < carminat_env->zone_count; i++)
+		zone += carminat_env->zone[i].size;
+	printf("Carminat Doom: zone %u KB in %u blocks, heap %u KB\n", zone >> 10, carminat_env->zone_count,
+	       (unsigned)(carminat_env->heap_end - carminat_env->heap) >> 10);
 	doomgeneric_Create(10, argv);
 	for (;;)
 		doomgeneric_Tick();

@@ -15,18 +15,19 @@ MAX_DIST = 120 / 1.8e-7 / 111320     # metres -> GPS units (latitude scale)
 CELL = 1 << 13
 
 
-def load(gpkg, bbox):
+def load(gpkg, bbox, country=None):
     """[(point, street name as the encoder writes it, number)]"""
-    db = sqlite3.connect(gpkg)
+    from .osmsrc import rows
     out = []
     for layer in ("points", "multipolygons"):
-        for other, geom in db.execute(
-                f"SELECT l.other_tags, l.geom FROM {layer} l JOIN rtree_{layer}_geom r ON l.fid = r.id "
+        key = "'p' || l.osm_id" if layer == "points" else "coalesce('r' || l.osm_id, 'w' || l.osm_way_id)"
+        for _, other, geom in rows(gpkg,
+                f"SELECT {key}, l.other_tags, l.geom FROM {layer} l JOIN rtree_{layer}_geom r ON l.fid = r.id "
                 "WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? AND r.miny <= ? "
                 "AND l.other_tags LIKE '%addr:housenumber%'", (bbox[0], bbox[2], bbox[1], bbox[3])):
             tags = hstore(other)
             m = re.match(r"\d+", tags.get("addr:housenumber", ""))
-            street = street_name(fold(tags.get("addr:street")))
+            street = street_name(fold(tags.get("addr:street")), country)
             if not m or not street or int(m.group()) >= 32767:
                 continue
             if layer == "points":

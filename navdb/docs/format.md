@@ -1,113 +1,132 @@
 # CARiN map database (`carindb`) — format reference
 
-State: 2026-10-23. Decoder: `navdb/decoder.py` (CLI) with the library in `navdb/libs/` (`carindb.py`, `unpack.py`, `spindex.py`, `layers.py`, `gpkg.py`, `qgis_style.py`).
-Source disc: `NAV_DB` (ISO9660, MapScape / Continental, CD 21435, 2013-04-08), Eastern Europe
-(PL, CZ, SK, HU, SI, HR, BG, LT, LV), built by `dbconv` from GDF 2.1 (Nokia/Navteq 2012 Q4),
-db release 34, "reduced_hnr.cpr".
+The map file of the Philips CARiN / Renault Carminat (Mk2) navigation, as far as it is known,
+written so that a decoder (`navdb/decoder.py`) and an encoder (`navdb/encoder.py`) can be built
+from it. Everything comes from the file itself and from the OS-9 modules that read it (`pbp`
+unpacks, `dbq` searches, `rpmod` routes), by static analysis. State: 2026-10-23.
 
-Everything here comes from the file and from the OS-9 modules that read it (flash 0209: `pbp`,
-`dbq`, `dbc`, `dbd`, `dbpa`), by static analysis (Ghidra, see the end). No emulator traces.
-**Confirmed** = seen in code (function given); **checked** = verified on decoded data; **seen** =
-pattern in the data only.
+**Marks used below:** **confirmed** = seen in the device's code (function named); **checked** =
+verified on the data (counts given); **seen** = a pattern in the data only; *open* = not known.
+
+Source of the reference data: the `NAV_DB` disc "carin_maps_pl_2012_2013" (CD 21435,
+MapScape / Continental, 2013-04-08): 11 Eastern European countries, Navteq 2012 Q4 data
+converted by `dbconv` from GDF 2.1, db release 34.
+
+## Contents
+
+0. [The big picture](#0-the-big-picture)
+1. [Conventions](#1-conventions)
+2. [File layout](#2-file-layout)
+3. [Unit compression](#3-unit-compression-pbp)
+4. [Routing parcels](#4-routing-parcels-tables-1-1e-3-2)
+5. [House numbers](#5-house-numbers-kind-4-units)
+6. [Background](#6-background-tables-6-16-15-1c-14-1d)
+7. [POI](#7-poi-tables-7-11-12)
+8. [Search](#8-search-tables-b-c-e-d-10-f)
+9. [Metadata and TMC](#9-metadata-and-tmc)
+10. [Writing a database (encoder rules)](#10-writing-a-database-encoder-rules)
+11. [Open questions](#11-open-questions)
+12. [Tools and reverse engineering](#12-tools-and-reverse-engineering)
+
+## 0. The big picture
+
+The file is a sequence of 2 KB blocks grouped into **units** (1-8 blocks). Units belong to
+**tables**; block 0 lists the tables. What the device does with them:
+
+```
+ map display        background units (6 zoom levels: water, forest, built-up, rivers, main roads)
+                    + routing parcels (the streets) when zoomed in
+ position -> map    spatial index of a table: grid cell -> leaf -> the unit covering the point
+ routing            parcels of routing level 0 (all roads) ... level 3 (motorways only):
+                    nodes, segments, rings of segments around nodes, links between parcels,
+                    a node existing on a higher level is the way up
+ address search     block 0 -> country trie (c) -> country (b) -> city trie (e) -> city (d)
+                    -> street trie (10) -> street entry (f) -> parcel segments
+                    -> house number unit (kind 4) -> exact segment and side
+ POI                POI units (7) -> names and details (11), lists per city / category (12)
+```
+
+| Table | Content | Section |
+|---|---|---|
+| 1, 1e, 3, 2 | routing parcels, levels 0-3 | 4 |
+| (no id) | per-segment house numbers, after table 1 | 5 |
+| 6, 16, 15, 1c, 14, 1d | background, levels 0-5 | 6 |
+| 7, 11, 12 | POI points, names / details, letter lists | 7 |
+| b, c, e, d, 10, f | countries, city and street search | 8 |
+| 17, 4, 0, 18 | info texts, index directory, TMC | 2, 9 |
 
 ## 1. Conventions
 
-- Big-endian everywhere.
-- **Coordinates** (GPS units): 1 unit = 1.8e-7 degree (1e-9 semicircles). Latitude = v × 1.8e-7;
-  longitude = v × 1.8e-7 − 30 (stored with +30°, so all values are positive). The GPS receiver
-  record and the map use the same units (`carin-gps-dr-chain` memory).
-- **Blocks**: 2048 bytes. **Units**: 1..8 consecutive blocks (max 16 KB). A **unit pointer** is a
+- **Byte order**: big-endian everywhere.
+- **Coordinates** (GPS units): 1 unit = 1.8e-7 degree. Latitude = v × 1.8e-7; longitude =
+  v × 1.8e-7 − 30 (stored with +30°). The GPS receiver record uses the same units. Boxes of the
+  coarse levels and the index grid start west of the offset, so boxes are signed i32.
+- **Blocks**: 2048 bytes. **Units**: 1-8 consecutive blocks (max 16 KB). A **unit pointer** is a
   u32: upper 24 bits = first block, low byte = length in blocks. Every unit starts with its own
-  pointer (checked on all 49 031 parcels).
-- **Point steps**: positions inside parcels / POI units / background units are u16 steps of
-  **64 GPS units** (≈ 1 m north-south) from the unit box corner (checked: the maximum coordinate is
-  box width / 64 for every parcel size). Background units store the step as a power of two in byte
-  0x33 (6 = 64 at level 0, up to 11 = 2048 at level 5; **checked**: the shapes join across units).
-- **Signed values**: boxes of the coarse levels and the index grid start west of the +30° offset
-  (x < 0), so box words are read as signed i32.
-- **Text**: lower case Latin-1, 0-terminated, in a text area of the unit; referenced by u16 offsets
-  (0 = none). Names keep the language's letters (ä, ö, …) but are mostly ASCII-folded ("zlota").
-- **Record sizes**: 93 record types with fixed sizes, from the block 0 table (`RECSIZE[type]`).
-  Both `dbq` (globals 0x0ef8 + 2·type, `FUN_00014dc4` defaults, `FUN_00014f60` load) and `pbp`
-  (0x0cf8 + 2·type, `FUN_0000325c` defaults) load it for types < 0x4e (**confirmed**).
+  pointer (**checked** on all units); word +4 = unit kind, byte +6 bit 0 = compressed, byte +7 =
+  blocks after unpacking.
+- **Slots**: most units start with descriptors `(u16 offset, u16 count)` at 8 + 4k that locate
+  record arrays ("slot k") inside the (unpacked) unit.
+- **Points**: positions inside units are u16 steps from the unit box corner: 64 GPS units (≈ 1 m)
+  in parcels and POI units; 2^(6 + level) in background units (byte 0x33).
+- **Text**: lower case, Latin-1, 0-terminated, inside the unit, referenced by u16 offsets (0 =
+  none). Names are mostly folded to ASCII ("zlota", "lodz").
+- **Record sizes**: 93 record types with fixed sizes, from the table in block 0 (`RECSIZE[type]`;
+  **confirmed**: `dbq` globals 0x0ef8 + 2·type, `pbp` 0x0cf8, `rpmod` 0x168). The types used here:
+  0x05 unit header 8, 0x08 segment 32, 0x09 segment 26, 0x10 node 8, 0x06 edge point 16, 0x0c shape
+  point 6, 0x0f neighbour 8, 0x12 class index 4, 0x13 signpost 6, 0x14 prohibited turn 8, 0x15
+  attribute 6, 0x37 house numbers 10, 0x3a area 20, 0x3c line 16, 0x40 place 10.
 - Success code of the db functions: 499 (0x1f3).
 
 ## 2. File layout
 
-### Block 0 (header)
+### Block 0 (header, table 13)
 
 | Offset | Value | Meaning |
 |---|---|---|
 | 0x02 | 0x0001 | low byte: CD number (**confirmed** pbp) |
-| 0x08 | 0x0060 | offset of a section at 0x60 (seen) |
-| 0x0c, 0x44 | u32 0x301, u16 0x0c, u16 count | **root of the country trie** (table c, block 3): offset and number of root nodes (9 on the original: b c e h l m p r s). **Confirmed** by the device: with the original count and a one-country trie the Country menu stays empty |
-| 0x1a | 34 | db release (**confirmed** pbp: warns unless 14..21; `FUN_000034c0` returns it to the unpackers) |
-| 0x24 / 0x26 | 0x68 / 31 | offset / count of the table id list (seen) |
+| 0x0c, 0x44 | u32 0x301, u16 0x0c, u16 n | **root of the country trie**: unit (table c, block 3), offset, number of root nodes (9 on the original). **Confirmed on the device**: a wrong count leaves the Country menu empty |
+| 0x1a | 34 | db release (pbp warns unless 14-21, works anyway) |
+| 0x24 / 0x26 | 0x68 / 31 | offset / count of the table id list |
 | 0x28 / 0x2a | 0xa6 / 93 | offset / count of the record size table, (u16 type, u16 size) pairs (**confirmed**) |
-| 0x2c | 0x0800 | block size (seen) |
-| 0x34 | 4 × u32 | bounding box min lon, min lat, max lon, max lat (checked: equals the extent of all decoded roads) |
-| 0x50 | 4 × u32 | the same box again, last value differs |
-| 0x220 | 16-byte entries | table directory (start = end of the size table padded to 16; seen) |
-| 0x838 | text | "no label", "no description", the conversion report |
-| 0x13b0, 0x25fc | text | country names |
-
-Block 1 has a similar header with a filler box (111111111, 222222222, …).
+| 0x2c | 0x0800 | block size |
+| 0x34, 0x50 | 4 × u32 | bounding box of the data (min lon, min lat, max lon, max lat); twice |
+| 0x60 | u32 0x201 | pointer to block 2 (index directory) |
+| 0x220 | 16-byte entries | **table directory** (after the size table, padded to 16) |
 
 ### Table directory
 
-Entry: `u32 a, u32 b, u32 c, u16 id, u16 0`, unit pointers. `a` = index part start (0 = none),
-`b` = data start, `c` = **last unit, inclusive** (checked: c + its length = the next table's
-start, and the spatial index references that unit). Tables lie back to back. Unit kind = word +4
-of each unit.
+Entry: `u32 a, u32 b, u32 c, u16 id, u16 0` (unit pointers): `a` = start of the table's spatial
+index part (0 = none), `b` = first data unit, `c` = **last data unit, inclusive** (**checked**).
+An empty table is (0, 0, 0) (table a on the original). Tables lie back to back:
 
-| Table | Data blocks | Index | Share | Kind | Compr. | Content | Decoded |
-|---|---|---|---|---|---|---|---|
-| 1 | 23fab–45871 | 22a67 | 38.4 % | 0 | 97 % | routing level 0 = full road network (parcels) | yes |
-| 1e | 4eed8–5092d | 4ee78 | 1.9 % | 3 | no | routing level 1 | yes |
-| 3 | 5095d–5118b | 5092e | 0.6 % | 2 | no | routing level 2 | yes |
-| 2 | 51198–51549 | 5118c | 0.3 % | 1 | no | routing level 3 | yes |
-| 6 | 515a4–55d72 | 5154a | 5.1 % | 0x16 | 90 % | background level 0 (fine) | yes |
-| 16 | 55dad–56d67 | 55d73 | 1.1 % | 0x15 | 85 % | background level 1 | yes |
-| 15 | 56da5–570e5 | 56d68 | 0.2 % | 0x1c | 69 % | background level 2 | yes |
-| 1c | 570ec–571a7 | 570e6 | 0.1 % | 0x14 | 53 % | background level 3 (Central and Eastern Europe) | yes |
-| 14 | 571ab–5725e | 571a8 | – | 0x1d | 41 % | background level 4 | yes |
-| 1d | 57261–5728d | 5725f | – | 0x1e | 7 % | background level 5 (all Europe, Atlantic, Greenland) | yes |
-| 7 | 1fee4–22a61 | 1f990 | 3.1 % | 6 | no | POI | yes |
-| 11 | 15a54–1f98e | – | 11.4 % | 0x10 | no | POI names, address, phone, postcode, access segments | yes |
-| f | 232d–14d84 | – | 21.3 % | 0x0e | no | street name index with house number ranges | yes (house numbers) |
-| d | 24–17e9 | – | 1.7 % | 0x0c | no | cities: names, street trie root, centre segment, POI per category / brand | yes |
-| e | 5–1d | – | – | 0x0d | no | city name trie into d | yes |
-| 10 | 17ee–2326 | – | 0.8 % | 0x0f | no | street name tries per city, into f | yes |
-| 12 | 14d8c–15a4c | – | 0.9 % | 0x11 | no | POI letter lists per city / category / brand, into 11 | yes |
-| 18 | 5728f–576f7 | – | 0.3 % | 0x17 | no | TMC location table (Czech), not needed | no |
-| 4 | block 2 | – | – | 7 | no | index directory (grid extent + zoom range per indexed table) | yes |
-| b | block 4 | – | – | 0x0a | no | countries: city trie root, POI categories, ISO code | yes |
-| c | block 3 | – | – | 0x0b | no | country name trie into b | yes |
-| 17 | block 1 | – | – | 0x13 | no | database info texts (Navteq 2012 Q4, GDF 2.1) | yes |
-| 0 | block 5728e | – | – | 0x18 | no | index of table 18 units (u32 pointer, u16 first record number, u16 0; 143 entries), TMC only | yes |
-| a, 13 | – | – | – | – | – | a empty; 13 = block 0 (the header) | – |
-
-**Outside the directory**: blocks 0x45872-0x4ee77 (26 562 units of kind 4, uncompressed, ≈ 10 %
-of the file) between table 1 and the index of table 1e = **per-segment house numbers**, one unit
-per level 0 parcel, pointed at by the parcel's word 0x54 (**confirmed** rpmod `FUN_000151cc`, the
-house number search). Unit: 8-byte header, slot 0 (0x10, count = the parcel's segment count),
-+12 = u32 pointer back to the parcel, then 10-byte records (type 0x37), one per segment in segment
-order: `left from, right from, left to, right to, scheme` (sides for travelling start → end,
-"from" at the start node; 32767 = none; scheme 0 none, 2 normal, 1 rare (mixed?)). Sides
-**checked** with POIs: the number of a POI lies in the left pair when its position is left of the
-segment (1 327 / 1 463) and in the right pair when right (1 427 / 1 542); the POI's access side
-flag (table 11 slot 4) is 0 = left, 1 = right. Warsaw: Nowy Świat 1-72, Marszałkowska up to 142;
-68 % of named segments have numbers. Table f's ranges are per street run (several segments) and
-differ from these in 68 % of segments; the decoder uses these.
-
-`CARINET` (separate file) = TMC event texts; not needed (no TMC in use).
+| Table | Kind | Content (original: blocks, share of the file, compressed units) |
+|---|---|---|
+| 17 | 0x13 | block 1: info texts (section 9) |
+| 4 | 7 | block 2: index directory (below) |
+| c | 0x0b | block 3: country name trie |
+| b | 0x0a | block 4: countries |
+| e | 0x0d | city name trie (5-1d) |
+| d | 0x0c | cities (24-17e9, 1.7 %) |
+| 10 | 0x0f | street name tries per city (17ee-2326, 0.8 %) |
+| f | 0x0e | streets with house number ranges (232d-14d84, 21.3 %) |
+| 12 | 0x11 | POI letter lists (14d8c-15a4c, 0.9 %) |
+| 11 | 0x10 | POI names and details (15a54-1f98e, 11.4 %) |
+| 7 | 6 | POI points (1fee4-22a61, 3.1 %, index at 1f990) |
+| 1 | 0 | routing level 0, all roads (23fab-45871, 38.4 %, 97 % compressed, index at 22a67) |
+| — | 4 | **per-segment house numbers** (45872-4ee77, ≈ 10 %), not in the directory (section 5) |
+| 1e, 3, 2 | 3, 2, 1 | routing levels 1, 2, 3 (never compressed) |
+| 6, 16, 15, 1c, 14, 1d | 0x16, 0x15, 0x1c, 0x14, 0x1d, 0x1e | background levels 0-5 (mostly compressed) |
+| 0, 18 | 0x18, 0x17 | TMC (section 9) |
+| a | — | empty |
 
 ### Index directory (table 4, block 2; **checked**, `libs/spindex.py`)
 
-Unit kind 7. From offset 0x14, 28-byte records: `u32 index start pointer, i32 x0, y0, x1, y1,
-u16 a, u16 zoom from, u16 zoom to, u16 0`; an all-zero record is skipped, the list ends at the
-first record without a 2^29 extent. The extent is the same for every table: x −34 998 272 ..
-501 872 640, y −59 092 992 .. 477 777 920 (lon −36.30°..60.34°, lat −10.64°..86.00°), 2^29 units square.
+Unit kind 7, three slots. Slot 0 from 0x14: 28-byte records `u32 index start pointer, i32 x0,
+y0, x1, y1, u16 a, u16 zoom from, u16 zoom to, u16 0`, one per indexed table (pointer 0 = table
+empty; an all-zero record is skipped; the list ends at the first record without a 2^29 extent).
+The extent is the same for all: x −34 998 272 .. 501 872 640, y −59 092 992 .. 477 777 920 (lon
+−36.30°..60.34°, lat −10.64°..86.00°).
 
 | Index of | a | zoom from–to |
 |---|---|---|
@@ -123,432 +142,361 @@ first record without a 2^29 extent. The extent is the same for every table: x �
 | 14 (background 4) | 0 | 1200–3000 |
 | 1d (background 5) | 0xffff | 3000–65535 |
 
-The zoom unit is not known yet (it looks like a display scale step); `a` is open (it counts down
-towards the coarse end of each family).
+Slot 1 (22 bytes) starts with the **unit pointer of TMC table 0** (then *open* offsets / counts;
++8 = a text offset, "ceska republika"). Slot 2 = **22-byte settings per country**, sorted by the
+country number (u16 number as in table b +40, then 500, 300, 1000, 0xf401 …); an encoder keeps
+only its countries.
 
-Table 4 has two more slots after the directory (descriptors at 0x0c and 0x10): slot 1 (22 bytes)
-starts with the **unit pointer of TMC table 0**, then offsets / counts (open; +8 = a text offset,
-"ceska republika"); slot 2 = **22-byte settings per country**, sorted by country number (u16
-number as in table b +40, then 500, 300, 1000, 0xf401, …, 0xffff; +13 = 1 for cz, sk). An encoder
-keeps only its countries there.
+### Spatial index (**checked** on all 11 indexed tables, `libs/spindex.py`)
 
-### Spatial index parts (**checked** on all 11 indexed tables, `libs/spindex.py`)
+Finds the data unit covering a position. The blocks from a table's index start `a` to its data
+start `b` hold kind 8 units, then kind 9 units.
 
-The blocks from a table's index start `a` up to its data start `b` hold units of kind 8, then kind 9.
+- **Kind 8** (8 blocks, 4092 cells each; the last one shorter): u32 at 0x0c = top cell size;
+  slot 0 = u32 pointers to kind 9 units (0 = empty). Together they form an **N × N grid** over
+  the directory extent, cell i = column i // N (x), row i mod N (y). N: table 1 512 (2^20 units ≈
+  0.19°), 7 256, 1e / 3 / 6 / 16 / 15 32, 2 8, 1c / 14 / 1d 1.
+- **Kind 9** (one per non-empty top cell): u32 at 0x10 = subcell size; slot 0 = n × n u16 (n = 1,
+  2, 4 … 64, the smallest n whose subcells each lie inside one data unit), column-major; each is
+  the byte offset of a u32 unit pointer in slot 1 (4-aligned) of the same unit, 0 = no data.
+- Every subcell points to the data unit whose box contains it. `libs/spindex.py` rebuilds all 11
+  original index parts **byte for byte** (`tests/test_spindex.py`).
 
-- **Kind 8** (always 8 blocks except the last; 4092 cells each; u32 at 0x0c = top cell size): slot 0 (word 8 offset, word 10 count) = u32 pointers
-  to kind 9 units, 0 = empty. All kind 8 units of a table together form an **N × N grid** over the
-  directory extent; cell i = column i // N (x, west to east), row i mod N (y, south to north). N:
-  table 1 512 (cells of 2^20 units ≈ 0.19°), 7 256, 1e/3/6/16/15 32, 2 8, 1c/14/1d 1.
-- **Kind 9** (one leaf per non-empty top cell): slot 0 = n × n u16 offsets (n = 1, 2, 4 … 64, chosen
-  per leaf by data density: the smallest n whose subcells each lie inside one data unit), subcells
-  in the same column-major order, **u32 at 0x10 = subcell size**; slot 1 starts 4-aligned. Each offset is
-  the **byte position of a u32 unit pointer** in slot 1 of the same unit, 0 = no data (sea, outside
-  the map). Slot 1 = the distinct unit pointers.
-- Every subcell points to the data unit (parcel / background unit / POI unit) whose box contains it:
-  100 % of the checked subcells, and every unit of tables 1e, 3, 2, 6, 16, 15, 1c, 14, 1d is
-  referenced. A position → unit lookup is thus: top cell → leaf → subcell → pointer.
-- For the encoder: the grid is fixed by the directory extent, so the writer only needs the data unit
-  boxes; pick n per leaf so that each subcell lies within one unit (units form a quadtree).
-  `libs/spindex.py` IndexPart rebuilds all 11 original index parts **byte for byte**
-  (`tests/test_spindex.py`).
+## 3. Unit compression (pbp)
 
-## 3. Unit unpacking (pbp, ported in `libs/unpack.py`)
+`pbp` reads a unit and, when byte +6 bit 0 is set, `FUN_00003508` expands it into (byte +7)
+blocks; otherwise it is copied. By kind: 0 → `FUN_00003eb2` (parcel), 0x14-0x16 and 0x1c-0x1e →
+`FUN_00004840` (background; this pbp zeroes compressed 0x1c-0x1e units, but they unpack with the
+same code), 0x0e → `FUN_000043a8` (*not ported*; table f is not compressed). Word +6 is cleared
+afterwards. Ported 1:1 in `libs/unpack.py`.
 
-`pbp` reads the blocks of a unit (`lseek` block·2048, `read` length·2048, up to 5 tries) and, when
-byte +6 bit 0 is set, `FUN_00003508` expands it into a buffer of (byte +7) blocks; uncompressed
-units are copied. Kind (word +4): 0 → `FUN_00003eb2` (parcel), 0x14..0x16 → `FUN_00004840`
-(background), 0x0e → `FUN_000043a8` (not ported; table f is not compressed anyway), other kinds
-are zero-filled. Word +6 is cleared afterwards.
+**The encoder does not compress.** It writes every unit as the image pbp leaves in RAM, with the
+compressed flag clear. The format allows it (all routing parcels of levels 1-3, ≈ 1 240 level 0
+parcels and ≈ 10 % of the background units are stored uncompressed on the original); the cost is
+only size.
 
-### Bit reader (`FUN_00004c16` and the fixed-width wrappers 0x4c2e.. 0x4caa)
+- **Bit reader** (`FUN_00004c16`): MSB-first bitfields (`bfextu`); **width 0 reads 32 bits and
+  does not advance**. `bits_for(v)` (`FUN_00004cc2`) = bits for 0..v−1 (1 for v = 1).
+- **Text code** (`FUN_00004abc`): `first`, `last` (N bits each), 6 phrases (5-bit length, 7-bit
+  bytes), then per byte a 2-bit code: 0 → 1 bit into `ae`, 1 → 2 bits into `str\0`, 2 → 3 bits
+  into ` dghilno`, 3 → 7 bits v: v > 0x26 literal, v ≤ 0x1b one of `e0 e1 e2 e3 e4 e5 e7 e8 e9 ea
+  eb ec ed ee ef f1 f2 f3 f4 f5 f6 f8 f9 fa fb fc fd ac`, 0x21-0x26 phrase v − 0x21.
+- **Delta points**: first x, y 16 bits; then per axis `0` → +d, `10` → −d, `11` → 16 bits.
+- **Parcel** (`FUN_00003eb2`): copy 116 bytes; 2 raw bytes (widths); raw copies of slots 3, 9, 10,
+  12; bit-coded slots 0, 1, 2, 4 (with a sentinel record), 5, 6, 7, 11, text; for release > 0x14 a
+  second pass over slots 0 and 4 and slot 13 cleared. Field order: `libs/unpack.py`.
+- **Background** (`FUN_00004840`, `FUN_000044a2`): copy 52 bytes, 4 width bytes, generic expander
+  for slots 0, 1, 2 (count + 1 records), 3, text; release > 0x13: slot 4 and second passes.
 
-MSB-first from a base pointer (`bfextu (A0){pos:w}`), position in bits. `FUN_00004c16(w)` adds w
-to the position, then extracts: **w = 0 extracts 32 bits and does not move** (68k bitfield width 0
-= 32). The background units rely on it. `N` = `bits_for(size of the unpacked unit)`;
-`bits_for(v)` (`FUN_00004cc2`) = number of bits for 0..v−1 (1 for v = 1, 16-bit arithmetic).
+## 4. Routing parcels (tables 1, 1e, 3, 2)
 
-### Text code (`FUN_00004abc`)
+A parcel is a square piece of the road network. Level 0 (table 1) has every road; levels 1, 2, 3
+(tables 1e, 3, 2) only roads of class ≤ 2, ≤ 1, 0, for long-distance routing. Parcel sides are
+32 768 · 2^k units on a quadtree aligned to the index grid (level 0: 2^15-2^21; levels 1-3:
+2^18-2^21).
 
-Read `first`, `last` (N bits each; both 0 = no text), then 6 phrases (5-bit length, 7-bit bytes).
-For each byte from `first` to `last`: 2-bit code; 0 → 1 bit into `ae`; 1 → 2 bits into
-`str\0`; 2 → 3 bits into ` dghilno`; 3 → 7 bits v: v > 0x26 literal, v ≤ 0x1b index into
-`e0 e1 e2 e3 e4 e5 e7 e8 e9 ea eb ec ed ee ef f1 f2 f3 f4 f5 f6 f8 f9 fa fb fc fd ac`,
-0x21..0x26 phrase v − 0x21 (copied, the position advances by its length). Tables from pbp data
-offsets 0x1342.. (its M$IData). Checked: the Warsaw parcel gives the real street names.
-
-### Delta-coded points
-
-First record: x = 16 bits, y = 16 bits. Next ones, per axis: `0` → prev + d, `10` → prev − d,
-`11` → 16 bits absolute; d has a per-unit width (parcels: global 0x0d99, background: 0x0dd0).
-
-## 4. Parcels (tables 1, 1e, 3, 2)
-
-Unit: 8-byte header (type 05: own pointer, kind, +6 compression flag, +7 unpacked blocks), then
-the 60-byte parcel header (type 11) = 15 slots `(u16 offset, u16 count)` at 8 + 4k (offsets
-into the unpacked unit), box (4 × u32) at 0x44, then (**checked**, all levels):
+### Header (116 bytes)
 
 | Offset | Level 0 | Levels 1-3 |
 |---|---|---|
-| 0x54 | u32 pointer of the parcel's **house number unit** (kind 4, see below), 0 = none | 0 |
-| 0x58 | u32 **parent parcel** one routing level up (table 1 → 1e → 3 → 2; 0 at the top) | same |
-| 0x5c | 0 | **child grid cell size** = box width / 16 (slot 8) |
-| 0x60, 0x64, 0x68 | **travel time to the routing level 3 / 2 / 1 network** in 0.1 s (rpmod `FUN_000195e2` ×100, `FUN_000012a4`: search radius per level = max(v × g_22a6, g_229a + v × g_229e), then ≥ previous × profile factor). **Checked** against Dijkstra with the router's default speeds: ≈ the mean over the parcel's nodes of the forward time to the nearest node of that level (within a few % for some parcels, up to ±30 % for others; Navteq's own speed model) | 0x20c49b each (2^31 / 1000, "infinite") |
+| 0x00 | unit header (kind 0) | unit header (kind 3 / 2 / 1) |
+| 0x08 | 15 slot descriptors | same |
+| 0x44 | box: i32 x0, y0, x1, y1 | same |
+| 0x54 | u32 pointer of the **house number unit** (section 5), 0 = none | 0 |
+| 0x58 | u32 **parent parcel** one level up (0 at the top) | same |
+| 0x5c | 0 | **child grid cell size** (slot 8) |
+| 0x60, 0x64, 0x68 | **travel time to the level 3 / 2 / 1 network** in 0.1 s (below) | 0x20c49b each ("infinite") |
 | 0x6c | 10 | 0 |
-| 0x70 | byte 0x70 = 1: **has a house number unit** (0x54; rpmod checks this byte before using 0x54); byte 0x71 = 1 in most parcels (open) | 0x00010000 |
+| 0x70 | byte 0x70 = 1: **has a house number unit**; byte 0x71 = 1 (*open*) | 0x00010000 |
 
-The first 116 bytes (type 0x0b) are never compressed.
+0x60-0x68 (**confirmed** rpmod `FUN_000195e2`, `FUN_000012a4`): the router multiplies them by 100
+and sets its search radius per level from them. **Checked** against Dijkstra with the router's
+default speeds: ≈ the mean forward time from the parcel's nodes to the nearest node of that level.
 
-### Text area (slot 14)
+### Layout (**checked**, `libs/parcelfmt.py`, `tests/test_parcelfmt.py`: every original parcel byte for byte)
 
-`count × 4` bytes of a name table (u16 text offset, u8 language, u8 flags: e.g. "spalato" language
-5 flag 2 for Split) in uncompressed units; **all zero after pbp unpacks a compressed unit**, so the
-software does not need it. The names follow, 0-terminated, unsorted, each once. Levels 1-3 have no
-text area (slot 14 = (0, 0)).
-
-### Writing parcels (encoder rule)
-
-Write each parcel as the **image pbp produces in RAM** from a compressed unit, stored uncompressed:
-slot 13 = (0, 0), segment +22 / +24 = 0, name table zero. That is the state 97 % of the original
-parcels are used in. `libs/parcelfmt.py` reproduces every original parcel byte for byte
-(`tests/test_parcelfmt.py`).
-
-### Unpacking (`FUN_00003eb2`)
-
-1. copy 116 bytes; widths: W51 = bits_for(count slot 2), W53 = bits_for(count slot 4 + 1),
-   W55 = slot 7 + 1, W59 = slot 10 + 1, W57 = slot 11 + 1, W5b = slot 12 + 1;
-2. 2 raw bytes → globals 0x0d98 (default width of segment +12) and 0x0d99 (point delta width);
-3. raw copies: slot 3 (type 0x12, count + 1 records), slot 9 (0x0f), slot 10 (0x14), slot 12
-   (0x15, if count ≠ 0);
-4. bit stream: slot 0 (`FUN_000035de`, mode 0x14), slots 1, 2 (`FUN_00003692`, `FUN_00003718`),
-   slot 4 segments (`FUN_0000379e`, mode 0x14, with a sentinel record after the last), slot 5
-   (`FUN_00003abe`), slot 6 (`FUN_00003be4`), slot 7 (`FUN_00003d28`), slot 11 (`FUN_00003e06`,
-   if count ≠ 0), text; release > 0x14: W5d from slot 13, second passes over slots 0 and 4
-   (mode 0x15) and slot 13 cleared (`FUN_00003e8a`).
-   The exact field order of every expander is in `libs/unpack.py` (1:1 with the C).
+Header, then the slot regions in memory order **0-7, 9, 8, 10-13**, each 4-aligned, then the text
+area. An empty slot points at the current position; a descriptor (0, 0) = slot absent (slot 13
+after pbp's second pass, slot 14 on levels 1-3).
 
 ### Slots
 
-| Slot | Record | Content (checked on Warsaw unless noted) |
+| Slot | Record | Content |
 |---|---|---|
-| 0, 1, 2 | 0x40 (10 B) | **place hierarchy**: slot 0 countries (+0 name, +2 **country number** as in table b +40, e.g. 53 hrvatska, 191 slovenija), slot 1 cities (+0 name, +2 municipality text, +4 parent country record), slot 2 streets (+0 street name or 0, +2 settlement / district text or 0, +4 parent city record); +6, +8 0. Each slot starts and ends with an empty record (its +4 = the first / last record of the slot above). Records are sorted by name |
-| 3 | 0x12 (4 B) | **class index**, count 7 + 1 records: record k = (offset of the first segment of class ≥ k, offset of the first slot 5 node whose most important incident class is ≥ k); record 7 = ends. Segments are sorted by class, slot 5 nodes by their best incident class (**checked**, 246 / 246) |
-| 4 | 0x08 (32 B), 0x09 (26 B) on levels 1-3 | **road segments**, below |
-| 5 | 0x10 (8 B) | **nodes** inside the parcel: x, y, +4 a segment at this node (entry into the +6/+8 ring), +6 **node byte** (below), +7 0 (rarely 1, 2) |
-| 6 | 0x06 (16 B) | **edge points** (x or y = 0 or max): +0 x, +2 y, +4 owning segment, +6 flags (open), +8 u32 **neighbour parcel**, +12 offset of the **same point's edge record there**, +14 0. **Checked**: 10 220 of 10 220 sampled are reciprocal (same coordinates, pointing back) |
-| 7 | 0x0c (6 B) | **shape points**: x, y, u8 flags (0 / 2), u8; a segment's shape points run from its +4 to the next segment's +4 (dbq `FUN_000149ba`), in start → end order. **Checked**: they lie between the end points |
-| 8 | 4 B | levels 1-3 only: **grid of child parcel pointers** (the level below) over this parcel's box: cell = word 0x5c = the size of the smallest child but at least 1/16 of the box, n = box / cell, column-major like the spatial index, each cell = the child holding its centre (0 = none). Count n² (sometimes fewer: trailing empty columns dropped) |
-| 9 | 0x0f (8 B) | **neighbour parcels**: u32 unit pointer, u16 x, u16 y = a point on the shared border in 64-unit steps from this parcel's corner (often its middle); the set equals the edge points' neighbours (**checked**, 407 parcels) |
-| 10 | 0x14 (8 B) | **prohibited turns** (**confirmed**, rpmod `FUN_0000ce00` loads them, `FUN_0000bb24` checks, the successor iterators `FUN_0000b93a` / `FUN_0000b8ae` skip a listed target): u32 parcel of the target (nearly always this one), u16 target segment, u16 flags; a segment's entries run from its +18 to the next segment's +18 (rpmod `FUN_0001d28a`). Bit 0 selects the travel direction on the source: 0 = travelling end → start (via node = start), 1 = start → end (via node = end). The router keeps at most 8 per direction. Bit 1 is read by neither rpmod nor dbq. Entries whose target is not at the via node never match (harmless) |
-| 11 | 0x13 (6 B) | **signposts** (dbq `FUN_00004cfc`, used by guidance, not by the router): text (destination, "krakow"), text (route number, "e77"), u16 direction 0 / 1; a segment's entries run from its +30 to the next segment's +30 (level 0) |
-| 12 | 0x15 (6 B) | **segment attributes** (rpmod `FUN_0000d34e`, `FUN_000109a4`): u16 type, u16 value, u16 bits; a segment's entries run from its +20 to the next segment's +20. Type 5 = **ferry crossing time in minutes** (router: time = 60 × value s); types 6 / 7 = **TMC location** for travel start → end / end → start (value = location code, bits 4-9 of the third word = location table number, bits 0-3 = country code, bits 2/3 of byte +4 direction flags), 8 = TMC (both); TMC is not needed |
-| 13 | – | cleared after release > 0x14 pass |
-| 14 | – | text area |
-
-### Routing topology (**checked**)
-
-A node is a point record (slot 5 inside, slot 6 on the edge). The segments at a node form a
-circular list through +6 (when the node is the segment's start) and +8 (when it is the end). Where
-a road crosses into the next parcel, both parcels hold an edge point at the same position, linked
-to each other (slot 6 +8 / +12); the router continues there. So an encoder must split roads at
-parcel borders, add the edge point pair and fill both rings.
+| 0, 1, 2 | 0x40 (10 B) | **places**. Slot 0 countries: +0 name, +2 country number (table b +40). Slot 1 cities: +0 name, +2 municipality text, +4 parent country record. Slot 2 streets: +0 street name or 0, +2 settlement / district text or 0, +4 parent city record. +6, +8 0. Each slot starts and ends with an empty record (+4 = the first / last record of the slot above); records sorted by name. Levels 1-3: two empty records each |
+| 3 | 0x12 (4 B) | **class index**, 7 + 1 records: record k = (first segment of class ≥ k, first slot 5 node whose best incident class ≥ k); record 7 = ends. Segments are sorted by class, nodes by best class (**checked**) |
+| 4 | 0x08 (32 B), 0x09 (26 B) on levels 1-3 | **segments** (below) + a sentinel record (+4, +18, +20, +30 = the ends of slots 7, 10, 12, 11) |
+| 5 | 0x10 (8 B) | **nodes**: x, y, +4 a segment at the node (entry into its ring), +6 node byte, +7 0 |
+| 6 | 0x06 (16 B) | **edge points** (on the parcel border): x, y, +4 segment, +6 node byte, +7 0, +8 u32 **neighbour parcel**, +12 offset of the same point's edge record there, +14 0 (**checked**: reciprocal) |
+| 7 | 0x0c (6 B) | **shape points**: x, y, 0, 0; a segment's shape runs from its +4 to the next segment's +4, start → end (**confirmed** dbq `FUN_000149ba`) |
+| 8 | 4 B | levels 1-3: **child grid**: n × n pointers to parcels of the level below, column-major, cell = word 0x5c = the smallest child, at least box / 16; each = the child holding the cell centre, 0 = none |
+| 9 | 0x0f (8 B) | **neighbour parcels**: u32 pointer, u16 x, u16 y (a point on the shared border, 64-unit steps) |
+| 10 | 0x14 (8 B) | **prohibited turns** (**confirmed** rpmod `FUN_0000bb24`): u32 parcel of the target, u16 target segment, u16 flags; bit 0 = direction on the source (0 = end → start, via its start node; 1 = start → end, via its end node); bit 1 *unused*. A segment's entries run from its +18 to the next segment's +18; the router keeps 8 per direction |
+| 11 | 0x13 (6 B) | **signposts** (guidance only): text (destination "krakow"), text (route "e77"), u16 direction; from the segment's +30 |
+| 12 | 0x15 (6 B) | **attributes**: u16 type, u16 value, u16 bits; from the segment's +20. Type 5 = **ferry time in minutes**; 6 / 7 / 8 = TMC location (not needed) |
+| 13 | — | consumed and cleared by pbp's second pass on level 0 |
+| 14 | text | `count × 4` bytes of a name table (zero after pbp unpacks), then the names |
 
 ### Segment record (type 0x08; type 0x09 = the first 26 bytes)
 
-The router's reading of a segment is rpmod `FUN_0000ce00` (edge record: +0x0a length, +0x0e/+0x12
-byte +17 nibbles, +0x0f one-way, +0x10 form of way, +0x11 class, +0x13 kind, +0x14 paved flag,
-+0x15 through traffic, +0x16 level ≥ 1, +0x17, +0x18 access code, +0x19, +0x1a cost key, +0x22 /
-+0x24 headings in 1/100 degree, +0x26..+0x2b node flags, +0x3c.. prohibited turns).
+How the router reads a segment: rpmod `FUN_0000ce00` (**confirmed** for every field it uses).
 
-| Offset | Content | Check |
-|---|---|---|
-| +0, +2 | start / end node (offsets of point records in slot 5 or 6) | the network draws correctly everywhere |
-| +4 | first **shape point** (slot 7); the shape runs up to the next segment's +4 | **confirmed** dbq `FUN_000149ba` |
-| +6, +8 | **next segment around the start / end node** (0 = the node is an edge point, continued in the neighbour parcel) | **checked**: ring length = node degree, 488 690 of 488 903 nodes; **confirmed** rpmod `FUN_0000c58e` |
-| +10 bit 7 | flag in the cost key (rpmod: from +10 for db release ≥ 0x15, from +28 bit 7 before); 1 on nearly all roads, 0 on e.g. unpaved streets (ul. Syta): probably **paved** | default speed tables are equal for 0 and 1 |
-| +10 bits 0-6 | not read by the router (139 = 0x8b, i.e. 11 with bit 7, most common; open) | |
-| +11 bits 0-3 | **form of way** (router cost key, see below): 0 motorway (A1, D1, M6), 1-3 motorway junction ramps ("wezel …", M0 ramps), 4 dual carriageway (S7, S8, Puławska), 7 single-carriageway trunk road (DN1, "8"), 8-10 ramps of other junctions ("wezel powazki"), 11 numbered road, 12 ordinary road / street, 13 rare, 14 **ferry** (Gdańsk–Nynäshamn), 15 ferry-like (router treats 14/15 alike) | nationwide sample |
-| +11 bits 4-5 | **one-way**: 0 both, 1 start → end only, 2 end → start only, 3 closed | **confirmed** rpmod `FUN_0000c870` / `FUN_0000c8bc` |
-| +11 bit 6 | flag copied to the edge (+0x19; use open) | |
-| +12 | **length in metres** | geometric length / value = 1.00 |
-| +14, +15 | **headings** at the ends, 256 steps per turn (router: × 36000 / 256) | |
-| +16 bits 0-3 | **road class (FRC)** 0 … 6 | |
-| +16 bits 4-6 | **kind**: 5 = not routable; the router never moves from a kind ≠ 5 segment onto a kind 5 one | **confirmed** |
-| +16 bit 7 | flag copied to the edge (+0x17; use open) | |
-| +17 bits 0-3 | **special figure**: 0 none, 2 traffic square ("plac", "trg", "körönd"), 3 restricted access (with high nibble), 5 junction-internal piece, 6 **roundabout**, 7 (rare), 9 unnamed connector. The router adds a turn penalty when leaving a 6, 5 or 7 piece onto another figure (rpmod `FUN_0000b2d6`, globals 0x2272 / 0x2276 / 0x227a) | nationwide sample |
-| +17 bits 4-7 | 2 normally; with low nibble 3 (or 4): 1 = **never entered** by the router, 4 = **destination only** (no through traffic) | **confirmed** `FUN_0000b8ae`, `FUN_0000ce00` |
-| +18 | start of the segment's slot 10 prohibited turns | **confirmed** |
-| +20 | start of the segment's slot 12 attributes | **confirmed** |
-| +22, +24 | type 09: +22 = slot 11 start (empty on levels 1-3), +24 0 | |
-| +26 | **slot 2 record**: street name, district, then city and country through the parents (type 08 only) | |
-| +28 bits 4-6 | level 0: **access code** checked when entering the segment (rpmod `FUN_0000bd04`): forward search forbids 1 and 4, and 3 / 6 when coming from a more important class; backward search forbids 2, 3, 5, 6. Seen: 3, 6 on minor roads (gates / access restrictions; exact meaning open) | **confirmed** use |
-| +28 bit 7 | the paved(?) flag for db releases < 0x15 | |
-| +30 | level 0: start of the segment's slot 11 signposts | **confirmed** |
+| Offset | Content |
+|---|---|
+| +0, +2 | start / end node (offset of a slot 5 or slot 6 record) |
+| +4 | first shape point (slot 7) |
+| +6, +8 | **next segment around the start / end node** (0 at an edge point; **checked**: the rings close with length = node degree) |
+| +10 | bit 7: **paved** (in the cost key); bits 0-6: speed category, ≈ km/h / 4 (31 motorway, 22 national, 11 street, 5 residential, 2 walkway; not read by the router) |
+| +11 | bits 0-3 **form of way** (below), bits 4-5 **one-way** (0 both, 1 start → end, 2 end → start, 3 closed), bit 6 flag (1 on motorways / dual carriageways; use *open*) |
+| +12 | **length in metres** |
+| +14, +15 | **headings** at start (towards the next point) and end (back towards the previous point), clockwise from north, 256 steps per turn |
+| +16 | bits 0-3 **road class** (FRC 0 motorway … 6 minor), bits 4-6 **kind** (5 = not routable; class 6 is usually 1), bit 7 flag (*open*) |
+| +17 | low nibble **figure**: 0 none, 2 traffic square, 3 restricted, 5 junction piece, 6 **roundabout**, 9 connector; high nibble **access**: 2 normal, with figure 3: 1 = never entered, 4 = destination only |
+| +18, +20 | start of the segment's slot 10 / slot 12 entries |
+| +22 | start of slot 13 entries (0 in a level 0 RAM image); +24 0 |
+| +26 | level 0: **street record** (slot 2): name, settlement, city, country through the parents |
+| +28 | level 0: bits 4-6 **access code** (router: forward search forbids 1, 4, and 3 / 6 from a more important class; backward forbids 2, 3, 5, 6); bit 7 = the paved flag for db releases < 0x15 (usually set); bit 12 always set; bits 0-2 and 11 *open* |
+| +30 | level 0: start of the segment's slot 11 entries |
 
-Through traffic (edge +0x15) is false for class 6 and for figure 3 / 4 unless the high nibble is
-4; a segment without through traffic (and its closed one-way 3) can only be entered from another
-such segment, i.e. destination zones.
+**Form of way** (+11 bits 0-3, **checked** nationwide): 0 motorway, 1-3 motorway junction ramps,
+4 dual carriageway (S7, S8), 7 single-carriageway trunk, 8-10 other junction ramps, 11 numbered
+road, 12 ordinary road / street, 14 ferry, 15 ferry-like.
 
-### Node byte (point +6)
+### Nodes and topology
 
-| Bits | Meaning | Check |
-|---|---|---|
-| 0-2 | node type by degree: 1 = **dead end** (degree 1), 5 = **pseudo node** (degree 2: attribute change; no turn penalty, rpmod `FUN_0000b2d6`), 0 = **junction** (degree ≥ 3); 4 rare (degree 2), 2 rare | **checked** on 41 000 nodes |
-| 4-5 | 1 = inside node (slot 5), 2 = **parcel edge point** (slot 6), 3 (rare) | |
-| 6-7 | **c = 3 − highest routing level the node exists on**: a node of level L also exists on level L + 1 iff c + L < 3 (rpmod `FUN_00015eb6`) | **checked**: levels 0, 1, 2: exactly the nodes with c + L < 3 have a node at the same coordinates in the parent parcel (+0x58), none of the others |
+Node byte (point +6): bits 0-2 type by degree (1 dead end, 5 pseudo node = degree 2, 0 junction);
+bits 4-5: 1 inside (slot 5), 2 edge point (slot 6); bits 6-7: **c = 3 − the highest routing
+level the node exists on** (**confirmed** rpmod `FUN_00015eb6`, **checked**: exactly the nodes
+with c + level < 3 exist in the parent parcel at the same coordinates). Edge points have c = 3 −
+their own level.
 
-### Routing levels (macro / micro) (**checked**)
-
-- Level L+1 is a subset network: its nodes are level L nodes (same coordinates), marked by the node
-  byte bits 6-7; its segments join such nodes, and one level L+1 segment stands for the level L
-  path between them (**checked**: around Warsaw 164 of 166 level 1 segments have exactly the
-  length of the shortest level 0 path between the same two nodes, the other two 0.99 / 0.97).
-- Up: parcel +0x58 → parent parcel, find the node at the same coordinates.
-- Down: slot 8 of a level ≥ 1 parcel = 16 × 16 grid of child parcels (cell size +0x5c).
-- So a router searches level 0 around start and destination until it reaches nodes that go up,
-  continues on the coarser levels, and comes down again through the child grid.
+- The segments at a node form a **ring** through +6 (node is the start) / +8 (node is the end).
+- Where a road crosses into the next parcel both parcels hold an **edge point** at the same
+  position, pointing at each other; the router continues there.
+- **Levels**: a level L + 1 segment joins two nodes that also exist on level L and stands for the
+  level L path between them (**checked**: same length). Up: parent pointer + same coordinates;
+  down: the child grid. The router searches level 0 near start and destination until it reaches
+  nodes that go up, continues on the coarse levels and comes down again.
 
 ### Router cost model (rpmod)
 
-- Edge cost key = class + 8 × form of way + 128 × paved flag (0..255).
-- Travel time = length × table[key] (`FUN_0000b148`, doubles at global 0x2286); ferries (form of way
-  14 / 15) use the slot 12 type 5 duration (minutes × 60) or a default.
-- `FUN_00001d02` builds the tables per route profile (4 profiles, weights at data 0x10aa:
-  0, 0.9, 0, 0.2) from the **default speeds** at data 0x18ca, `speed[paved][form of way][class]`
-  in m/s: form of way 0 (motorway): 36 (130 km/h) for classes 0-3; 3: 28 for classes 0-1;
-  otherwise 24, 24, 16.5, 12, 7.5, 4.5, 3 for classes 0-6 (86 … 11 km/h).
-- Turn costs: class-to-class penalty tables (7 × 7 u32 at globals 0x21a6 / 0x20e2) by turn type
-  (`FUN_0000b65e`), roundabout exits, none at pseudo nodes.
-- For the encoder: class and form of way are what decide the speed; prohibited turns, one-way,
-  through-traffic and access codes decide what is allowed.
+- Cost key = class + 8 × form of way + 128 × paved; travel time = length × table[key]
+  (`FUN_0000b148`), ferries: slot 12 type 5 minutes.
+- Default speeds (rpmod data 0x18ca, `speed[paved][form of way][class]`, m/s): form of way 0:
+  36 (130 km/h) for classes 0-3; 3: 28 for classes 0-1; otherwise 24, 24, 16.5, 12, 7.5, 4.5, 3
+  for classes 0-6. Four route profiles (weights at data 0x10aa).
+- Turn costs by class pair and turn type (`FUN_0000b2d6`), extra for leaving roundabouts and
+  junction pieces, none at pseudo nodes. A route may not use prohibited turns, closed or
+  destination-only segments (except from such segments) and access codes as above.
 
-Counts: level 0 49 031 parcels / 8 613 555 segments; level 1 3 278 / 190 263; level 2 1 056 /
-70 107; level 3 715 / 22 228.
+Original counts: level 0 49 031 parcels / 8.6 M segments; level 1 3 278 / 190 k; level 2 1 056 /
+70 k; level 3 715 / 22 k.
 
-## 5. Background (tables 6, 16, 15, 1c, 14, 1d = levels 0–5; `FUN_00004840`, `FUN_000044a2`)
+## 5. House numbers (kind 4 units)
 
-Six levels, finer to coarser, ordered by their zoom ranges in the index directory; unit kinds 0x16,
-0x15, 0x1c, 0x14, 0x1d, 0x1e; unit box sizes 2^21 … 2^26 units, point step 2^6 … 2^11 (byte 0x33).
-This pbp (made for releases 14..21) zeroes compressed units of kinds 0x1c..0x1e; they have the same
-layout and unpack correctly with `FUN_00004840` (checked: the coastlines and roads join up).
+Not in the table directory: the units right after table 1, one per level 0 parcel that has
+numbers, pointed at by the parcel's word 0x54 (byte 0x70 = 1) (**confirmed** rpmod
+`FUN_000151cc`, the house number search).
 
-Unit: 8-byte header, slots 0-4 at 8 + 4k (a 0x3d = 52-byte header, copied raw), box at **0x20**.
-Unpacking: copy 52 bytes; Wca = bits_for(count slot 3 + 1); 4 raw bytes → globals 0x0dce,
-0x0dcf, 0x0dd0, 0x0dd1 (widths); bit stream with the generic expander `FUN_000044a2(slot, size,
-code, mode)` for slot 0 (code 0x25), 1 (0x26), 2 (0x27), 3 (0x0b wide / 0x0a narrow), text;
-release > 0x13: 5 bytes → 0x0dd2..0x0dd6, slot 4 (code 0x28, mode 0x14), second passes over slots
-1 and 2. Codes 0x25-0x27 handle count + 1 records (sentinel).
+Unit: 8-byte header (kind 4), slot 0 (0x10, count = the parcel's segment count), +12 = u32
+pointer back to the parcel, then one 10-byte record per segment in segment order:
+`left from, right from, left to, right to, scheme`. Left / right for travelling start → end,
+"from" at the start node, 32767 = none; scheme 2 normal, 1 mixed (*seen*), 0 none. Sides
+**checked** with POI positions (≈ 91 %).
+
+## 6. Background (tables 6, 16, 15, 1c, 14, 1d)
+
+The map picture on 6 levels, fine to coarse (zoom ranges in the index directory): areas (water,
+forest, built-up …) and lines (rivers, railways, main roads).
+
+| Level | Table | Kind | Unit side | Point step |
+|---|---|---|---|---|
+| 0 | 6 | 0x16 | 2^19-2^21 | 64 |
+| 1 | 16 | 0x15 | 2^21-2^22 | 128 |
+| 2 | 15 | 0x1c | 2^22-2^23 | 256 |
+| 3 | 1c | 0x14 | 2^24 | 512 |
+| 4 | 14 | 0x1d | 2^25 | 1024 |
+| 5 | 1d | 0x1e | 2^26 | 2048 |
+
+Layout (**checked**, `libs/bgfmt.py`, `tests/test_bgfmt.py`: all 6 356 original units byte for
+byte): 52-byte header (unit header, slot descriptors 0-5, box at 0x20, word 0x30 = 1, byte 0x33 =
+step as a power of two), then the slot regions back to back in order 0-5, no padding; a missing
+slot has offset 0.
 
 | Slot | Record | Content |
 |---|---|---|
-| 0 | 0x3b (4 B) | groups of slot 1 records by **area type**: 7-bit type, 1 bit, offset of the first record of the group |
-| 1 | 0x3a (20 B) | **areas**: +0 name, +2 first point (pointer into slot 3), +4 **area in m²** (Las Kabacki 9.0 km² = real), +8/+12 label position (GPS units, Warsaw → 21.01 E 52.23 N), +16/+18 second pass |
-| 2 | 0x3c (16 B) | **generalised roads**: +0 name = road number ("8", "61", "631"), +2 first point, +4 attribute, +8/+10 second pass |
-| 3 | 8 B (wide) / 4 B | **points**: wide = absolute u32 lon, u32 lat; narrow = 16-bit x/y offsets in steps of 1 << byte 0x33 from the box. Wide when word (8 + 0x10 + RECSIZE[0x3f]) is 0 |
-| 4 | 0x15 (6 B) | three u16 (second pass); meaning open |
+| 0 | 4 B | **groups**: u8 type, u8 kind (0 = areas, 1 = lines), u16 offset of the first record; + an end record (offset = end of the last record region). The order is the **drawing order**: areas 3, 5, 6, 8, 1, then lines 101-106 |
+| 1 | 0x3a (20 B) | **areas** + end record (+2 = end of the points): +0 name, +2 first point, +4 area in m², +8 / +12 label position (absolute), +16 0, +18 its slot 5 entry |
+| 2 | 0x3c (16 B) | **lines** + end record: +0 name (road number, river), +2 first point, +4 length in metres, +8 its slot 5 entry, +10, +12 0 |
+| 3 | 4 B | **points**: u16 x, y steps from the box corner; a record's shape runs to the next record's first point; rings are not closed |
+| 4 | 6 B | three u16 (names), only in some units; not needed |
+| 5 | 4 B + text | name table, one entry per record (zero in RAM), then the names |
 
-A record's shape = points from its +2 pointer to the next record's +2 pointer. Area types: 1
-water (seas, lakes, rivers), 3 forest / park, 5 built-up, 6 cemetery, 8 island. Sea polygons are
-cut along unit borders (straight lines in the sea). Type 8 also covers Greenland / large land
-masses at level 5, so "land" may be the better name. Counts (areas / roads): table 6 253 656 /
-110 019, 16 47 739 / 101 277, 15 12 345 / 20 442, 1c 1 072 / 3 756, 14 919 / 3 691, 1d 191 / 77
-(before the last-unit fix, so +1 unit each). Level 1-5 road names include foreign roads (Czech
-"d1", "d8").
+**Area types**: 1 water, 3 forest / park, 5 built-up (named after the town on coarse levels), 6
+cemetery, 8 land / island. **Line types** (**checked**): 101 rivers and canals, 102 railways
+(level 0), 103 probably borders (levels 3-5), 104 main roads (A, S, main national), 105 other
+national roads, 106 voivodeship roads. The original drops 106 above level 1 and 105 above level 2.
 
-## 6. POI (table 7, kind 6, uncompressed) and their names (table 11)
+## 7. POI (tables 7, 11, 12)
 
-Unit: +8 slot (offset, count) of 28-byte records, +0x10 box. Record: +0 u32 unit pointer into
-**table 11** and +4 u16 offset of an 8-byte name entry there (+0 = text offset of the name in that
-unit); +6/+8 x/y (steps of 64 from the box); +10 **category**; +12 **brand** text offset in this
-unit ("lukoil", "pko bank polski"); +16 u32 (?); rest 0. 698 013 POI, 44 categories (names in
-`POI_CATEGORIES`, from the names under each code): 11 car dealer, 12 fuel, 13 car rental, 14
-parking, 15 P&R, 20 sight, 21 hotel, 22 restaurant, 23 bank, 24 culture centre, 25 library,
-26 court, 29 embassy, 30 ATM, 31 tourist info, 32 museum, 33 theatre, 35 sport, 36 church, 37
-cemetery, 38 racing, 39 park, 40 exhibition, 41 hospital, 42 police, 43 town hall, 44 post, 45
-clinic, 46 pharmacy, 47 shop, 48 locality, 49 cinema, 50 golf, 51 railway station, 52 airport, 54
-bus station, 56 school, 57 nightlife, 59 car service, 61 company; 16, 53, 55, 58 not named yet.
+- **Table 7** (kind 6): +8 slot of 28-byte records (+0x0c slot empty), +0x10 box (u32 x0, y0,
+  x1, y1; 2^21 square on the original), records at 0x20, then the brand texts. Record: +0 u32
+  table 11 unit, +4 offset of the name entry there, +6 / +8 x, y (steps of 64 from the box
+  corner), +10 **category**, +12 brand text, +14 0, +16 u32 **POI id** (the same as the detail
+  record's +28), +20..+27 0. Spatial index grid 256 (section 2). Categories (named from the data): 11 car dealer, 12 fuel, 13 car rental, 14
+  parking, 15 P&R, 20 sight, 21 hotel, 22 restaurant, 23 bank, 24 culture centre, 25 library, 26
+  court, 29 embassy, 30 ATM, 31 tourist info, 32 museum, 33 theatre, 35 sport, 36 church, 37
+  cemetery, 38 racing, 39 park, 40 exhibition, 41 hospital, 42 police, 43 town hall, 44 post, 45
+  clinic, 46 pharmacy, 47 shop, 48 locality, 49 cinema, 50 golf, 51 railway station, 52 airport,
+  54 bus station, 56 school, 57 nightlife, 59 car service, 61 company.
+- **Table 11** (kind 0x10): name units (section 8 frame, next / previous unit at 0x28 / 0x2c):
+  slot 0 = 8-byte name entries (name, flags, second text = district, detail offset), sorted by
+  name per list; slot 1 = 40-byte **detail records**; slot 4 = 8-byte **access records** (u32
+  level 0 parcel, u16 segment offset in the parcel, u16 side 0 left / 1 right); then the texts.
+  Detail: +0 / +4 i32 lon, lat; +8 / +10 offset / count of its access records; texts +12 brand,
+  +14 street, +16 city, +18 municipality ("sibensko kninska zupanija"), +20 country, +26 house
+  number, +32 phone, +34 postcode; +28 u32 POI id; +22, +24, +36, +38 0.
+- **Table 12** (kind 0x11): tries (section 8 frame, 12-byte nodes) into table 11, mostly one
+  level (a node per first letter; 444 of 556 769 nodes are inner nodes); a leaf never leaves its
+  unit (up to 236 names).
+- **Lists**: a list = one category of one city (table d slot 3) or of the whole country (block 4
+  slot 3: the original lists 20, 32, 35, 37-40, 52, 53, 58 country-wide). Category record (12 B):
+  u32 table 12 unit, u16 offset, u16 count of the trie root, u16 category, u16 offset of the
+  category's **brand list** in the same unit (slot 5: 12-byte records u32 table 12 unit, u16
+  offset, u16 count, u16 brand text). A brand list runs to the next category's offset; empty
+  lists all point at the same place (the text start on the original's block 4).
 
-Table 11 units (kind 0x10) have the layout of table d: 8-byte name entries (+0 name, +2 0x00ff,
-+4 0, +6 offset of a detail record).
+## 8. Search (tables b, c, e, d, 10, f)
 
-## 7. Search indexes
+Address entry goes **country → city → street → house number**. Every step is a trie of names
+(fast typing) leading to a sorted list of name entries.
 
-### Table f: streets and house numbers (checked)
+### Building blocks
 
-10 020 units (kind 0x0e, uncompressed), a doubly linked sorted list (+0x28 next unit, +0x2c
-previous). Slot 0 at 0x30: 8-byte entries, 2 819 556 street names, sorted (+0 name, +2 flags:
-0xff, 0x10ff, 0x12, 0x1012, 0x13, 0x1b …, +4 0, +6 offset of a slot 1 record). Slot 1: 6-byte runs
-(+0 offset into slot 2, +2 count, +3 flag). Slot 2: 3 522 574 items of 24 bytes:
+- **Name units** (tables d, f, 11; b in block 4): 0x30-byte header (slots at 8, next / previous
+  unit of the list at 0x28 / 0x2c), slot 0 at 0x30 = 8-byte **name entries** `+0 name, +2 flags,
+  +4 second text, +6 offset of the entry's record`, sorted; then the records and the texts.
+- **Flags**: low byte = language of the name (0x12 Polish, 0x13 Czech, 0x14 Slovak, 0x17
+  Slovenian, 0x18 Lithuanian, 0x1a Croatian, 0x1b Latvian, 0xff none); high byte = variant: 0x10
+  **rotated words**, 0x02 foreign spelling, 0x01 alternative name. Each variant is its own entry.
+- **Rotations** (**checked**): "ulica adama mickiewicza" (0x12) also appears as "adama mickiewicza
+  ulica" and "mickiewicza ulica adama" (0x1012): the street word moves to the cut, no rotation
+  starts with a number. Multi-word city names rotate the same way without the street word.
+- **Tries** (tables c, e, 10, 12): 12-byte header (pointer, kind, 0, slot 0 = nodes at 0x0c),
+  12-byte nodes `u32 unit, u8 character, u8 leaf, u16 offset, u16 count, u16 0`; leaf 0 = a list
+  of child nodes (in the same unit), leaf 1 = `count` consecutive name entries at offset in a name
+  unit. Every name under a node starts with its characters (**checked**).
 
-| Offset | Content |
+### The chain
+
+| Step | Where | What |
+|---|---|---|
+| countries | block 0 0x0c → table c (block 3) → table b (block 4) | b's 56-byte country record: +0 / +4 / +6 table e unit / offset / count = **the country's city trie root**; +24 / +26 country-wide POI categories; +40 **country number**; +46 ISO code ("pl"); +8..+38 constants (*open*) |
+| cities | table e → table d | d's 24-byte **city record**: +0 / +4 / +6 table 10 unit / offset / count = **the city's street trie root**; +8 / +10 the city's POI categories (slot 3); +12 parcel and +16 segment offset = the city's destination |
+| streets | table 10 → table f | f's entry: +4 = settlement text (0 = the whole city), +6 = a 6-byte **run** `u16 first item, u8 count, u8 1, u16 0` |
+| items | table f slot 2 | 24-byte **item**: u32 lon, lat of the settlement, **even from / to, odd from / to** (32767 none), u32 parcel, u16 offset of the first segment, u16 number of consecutive segments |
+| number | parcel → house number unit | the exact segment and side (section 5) |
+
+**Cities** in Poland (as Navteq made them): the gminas (municipality = powiat: "piaseczno" /
+"powiat piaseczynski", "warszawa" / "warszawa") and the settlements and districts (municipality =
+their gmina: "nowa iwiczna" / "lesznowola", "wola" / "warszawa"), each with its own street trie.
+A gmina has for every street one entry for the whole gmina plus one per settlement.
+
+City POI lists (table d slot 3, 12 B): u32 table 12 unit, u16 offset, u16 count, u16 category,
+u16 offset of the category's brand list (slot 5: 12 B, table 12 unit / offset / count, brand text).
+
+**Country numbers** = the 1-based place in an alphabetical English list of countries, an ISO
+3166 list from before 2006 (all 11 countries of the original fit: bg 33, hr 53, cz 56, ee 67, hu
+97, lv 117, lt 123, pl 171, ro 176, sk 190, si 191). The firmware has no country list (country
+names come from the disc); the encoder gives Serbia 188 (after Senegal, a guess) with Croatia's
+record constants, settings and language byte.
+
+`tests/check_search.py` walks the chain like the device (the original passes 92-99.9 %: names in
+other languages; the encoder output 100 %).
+
+## 9. Metadata and TMC
+
+- **Block 1** (table 17, kind 0x13): info texts ("no label", "no description") and the
+  **conversion report** at 0x50 (offset at 0x32, length incl. the 0 at 0x34): "1. name:
+  eeu_nok_nok_12q4_20130205p", "2. content: eastern-europe", "9. conversion date", "12.
+  conversion by" …; box at 0x1c. The encoder writes its own report there (OSM source, conversion
+  time in ISO 8601 UTC, host name).
+- **TMC** (traffic messages over RDS, not used): table 18 (kind 0x17) = location table (Czech),
+  table 0 (kind 0x18) = list of its units (u32 pointer, u16 first record, u16 0); slot 12 types
+  6-8 in the parcels; the `CARINET` file on the disc (event texts). The encoder leaves tables 0
+  and 18 empty.
+- **Disc**: ISO 9660 in MODE2 Form 1 sectors with CD-XA attributes, volume `NAV_DB`, files
+  BIBLIOGR (CD id, db release and the **compatible software releases**: kept unchanged), COPYRIGH,
+  ABSTRACT, CARINET, carindb at LBA 395 (`tools/mkdisc.py`).
+
+## 10. Writing a database (encoder rules)
+
+What `navdb/encoder.py` does, as rules any writer must follow:
+
+1. **Units as RAM images** (section 3): parcels with slot 13 = (0, 0), segment +22 / +24 = 0
+   and zero name tables; background units with zero name tables. Level 0 parcels are then
+   compressed (`libs/pack.py`, the inverse of pbp; about 2x), everything else stays uncompressed.
+2. **Parcels** on a quadtree aligned to the index grid, at most 8 blocks each. A road becomes
+   segments between nodes (junctions, attribute changes, parcel borders); bends are shape points.
+   Roads crossing a parcel border are cut; the cut point is an edge point pair (never at a corner,
+   never on another vertex, one per pair of parcels). Segments sorted by class, nodes by best
+   class, class index, node rings, node bytes, neighbour list.
+3. **Levels 1-3**: roads of class ≤ 2 / ≤ 1 / 0, chains through degree-2 nodes joined into one
+   segment (length = sum; loops cut in two), shapes simplified; a node kept on a level is kept on
+   every level below, node byte c = 3 − its top level; parcels are quadtree ancestors of the level
+   below (≥ 2^18 for levels 1-2, ≥ 2^20 for level 3, ≤ 2^21), parent pointers and child grids.
+   Level 0 header 0x60-0x68 = mean travel time to each level's network.
+4. **House number units** per parcel with numbers (0x54, byte 0x70).
+5. **Background**: only for the encoded area, 6 levels with the original unit sizes, groups in
+   drawing order, end records, shapes simplified and cut to the area and the unit box; every
+   background table gets at least one unit.
+6. **Search**: country, cities (gminas + settlements), streets with rotations, tries whose
+   leaves stay inside one name unit, linked lists, city destinations; block 0 0x0c / 0x44 = the
+   country trie root count; block 2 slot 2 = only our country (settings of its template country).
+   Trie leaves are split by size too (big cities' street lists).
+7. **POI** (basic set): table 7 points in quadtree tiles (≤ 2^21, ≤ 400 points), table 11 lists
+   per (gmina, category) with one access segment each (the nearest road, motorways avoided),
+   table 12 tries; city records list their categories, the country record airports and museums;
+   brand lists empty.
+8. **Spatial indexes** for every indexed table (grid N as the original) and the index directory.
+9. **Taken from the original as metadata only**: the record size table and the layout of blocks
+   0-2 (with the zoom ranges), the 56-byte country record constants, the disc structure,
+   BIBLIOGR and CARINET. No map data.
+
+Verification: `tests/check_db.py` (structure rules; the original passes them too),
+`tests/check_search.py` (the address search chain), `tests/compare_osm.py` (road lengths per
+attribute group against OSM), decoding with `decoder.py`, and finally the device / emulator.
+
+**OSM mapping** (`libs/osmnet.py`, `osmplaces.py`, `osmaddr.py`, `osmbg.py`, `osmpoi.py`; one
+country per disc, `libs/countries.py`):
+
+| OSM | CARiN |
 |---|---|
-| +0, +4 | u32 lon, u32 lat: the town of the street (same for all items of a street) |
-| +8, +10 | **house number range** of the run, first pair (32767 = none); whole-run ranges for the street search, not per segment |
-| +12, +14 | second pair |
-| +16 | u32 unit pointer of a **table 1 parcel** |
-| +20 | offset of the first segment (slot 4) in the unpacked parcel |
-| +22 | number of consecutive segments of the street |
+| highway motorway / trunk / primary / secondary / tertiary / unclassified / residential / living_street, service, track | class 0 / 0 / 1 / 2 / 3 / 4 / 5 / 6, 6, 6 (track not routable) |
+| motorway, trunk + oneway, \*_link, ref | form of way 0, 4, ramps 1 / 3 / 10, 11 |
+| oneway, junction=roundabout, access / motor_vehicle private / destination / no | one-way, figure 6, figure 3 + access 4 / 1 |
+| surface unpaved | paved bit 0 |
+| name (Poland: + "ulica " unless it starts with a street word), ref; Cyrillic → Latin (đ = dj), then ASCII | street name |
+| Poland admin_level 7 / 6 / 8 / 9, place nodes | city (gmina) / municipality (powiat) / settlement / district |
+| Serbia admin_level 7 else 8 / 6 / 9 / 8; "Град (Кварт)" → district, "(село)" dropped | city (grad, opština) / municipality (okrug) / settlement (naselje) / district (gradska opština) |
+| addr:housenumber + addr:street | house numbers on the nearest segment of the street, by side |
+| amenity fuel / hospital / police / bus_station / car_rental / parking + park_ride, tourism hotel / motel / museum, shop car / car_repair, railway station / halt, aeroway aerodrome (iata or public) | POI 12 / 41 / 42 / 54 / 13 / 15, 21 / 32, 11 / 59, 51, 52 |
+| natural water, landuse forest, leisure park, landuse cemetery, landuse residential …, place island, waterway river / canal, railway rail | background areas 1, 3, 3, 6, 5, 8 and lines 101, 102 |
 
-Check: the segments pointed at carry the same street name (+26); Warsaw: Nowy Świat 1-72, Złota
-up to 83, Puławska up to 623, Marszałkowska 1-142. Per-segment numbers come from the kind 4
-units instead (section 2, `roads.hn_left_from` … `hn_right_to`). 1 866 553 distinct runs
-(several entries point at the same segments, e.g. names in other languages). Open: what the
-flags mean (see the name entries below); the street → city link is the table 10 trie.
+## 11. Open questions
 
-### Name entries and flags (tables d, f, 11; **checked**)
+None of these blocks map display, routing or address search as far as the device code shows:
+the exact meaning of the access codes 1-6 and of figures 5 / 7 / 9 (the router's handling is
+known); segment +10 speed category, +11 bit 6, +16 bit 7, +28 bits 0-2 (not used by the router);
+parcel byte 0x71; house number scheme 1; country record +8..+38; table 11 detail +22 / +24;
+how the device ends the last brand list of a city; the index directory's `a` field and the zoom unit; background slot 4 and line type 103;
+TMC tables (not needed); the compression encoder (not needed).
 
-Tables d, f and 11 share the unit frame: slot 0 at 0x30 = 8-byte name entries, sorted, `+0 name,
-+2 flags, +4 second text (d: municipality, 11: district, f: 0), +6 offset of the entry's record`;
-+0x28 / +0x2c = next / previous unit (a doubly linked list). Flags: **low byte = language /
-country code** of the name (0x12 Polish, 0x13 Czech, 0x14 Slovak, 0x17 Slovenian, 0x18
-Lithuanian, 0x1a Croatian, 0x1b Latvian, 0xff none: Romanian, Bulgarian, Hungarian names);
-**high byte = variant bits**: 0x10 words rotated for search ("ablanovo dolno" for "dolno
-ablanovo", "ulica marszalkowska" / "marszalkowska ulica"), 0x02 foreign spelling ("bourgas",
-"blagoewgrad"), 0x01 alternative name. Each variant is its own entry pointing at the same record.
-
-### Tries (tables e and 10; **checked**)
-
-12-byte nodes: `u32 unit pointer, u8 character, u8 leaf, u16 offset, u16 count, u16 0`. leaf 0:
-the next character's node list (count nodes at offset in the unit pointed at, in table 10 / e
-itself); leaf 1: a run of `count` consecutive name entries (slot 0) at offset in the unit pointed
-at. Prefixes are complete: every name under a node starts with its characters (checked on all 13 459
-street entries of Warsaw, depth 1-8).
-- **Table 10** (kind 0x0f) = per city **street name trie** into table f; the root list is given by the
-  city record (+0/+4/+6). This is the street → city link: a city's streets are reached only
-  through it (Warsaw: 33 root nodes, 13 459 entries, 11 175 distinct names).
-- **Table e** (kind 0x0d, 4 units) = **city name trie** into table d, one root per country (the
-  country record in table b gives it); table d is grouped by country.
-
-### Table d: cities (kind 0x0c; **checked**)
-
-Slot 0 = name entries (second text = municipality / district). Slot 1 = 24-byte **city records**:
-
-| Offset | Content |
-|---|---|
-| +0 | u32 unit pointer into **table 10** (street trie root) |
-| +4, +6 | offset, count of the root nodes |
-| +8, +10 | offset, count of the city's **POI category entries** (slot 3) |
-| +12 | u32 unit pointer of a **table 1 parcel** |
-| +16 | offset of a **segment** (slot 4) in the unpacked parcel: the city's destination point (its place chain holds the city name in 75 %, the municipality in 94 % of sampled cities) |
-| +18..+23 | 0 |
-
-Slot 3 = 12-byte **POI category entries**: `u32 table 12 pointer, u16 offset, u16 count` (the
-letter list of the POI names of this category in this city), `u16 category` (the table 7 code:
-11 dealers, 12 fuel …), `u16 offset into slot 5` (the brand list; the next entry's value ends it).
-Slot 5 = 12-byte **brand entries**: `u32 table 12 pointer, u16 offset, u16 count` (letter list of the
-POIs of that brand), `u16 brand text offset` in this unit ("audi" … "volvo" for dealers in Warsaw,
-"orlen", "bp", "shell" … for fuel), `u16 0`.
-
-### Table 12: POI letter lists (kind 0x11; **checked**)
-
-Trie nodes as above (one level: one node per first letter, leaf 1) into the table 11 name entries.
-
-### Table 11: POI names and details (kind 0x10; **checked**)
-
-Slot 0 = name entries (second text = district, e.g. "bemowo"), +6 = offset of a 40-byte **detail
-record** (slot 1). Table 7 POI records point at their name entry (+0 unit, +4 offset).
-
-| Offset | Content |
-|---|---|
-| +0, +4 | u32 lon, u32 lat (equal to the table 7 position) |
-| +8, +10 | offset, count of the **access segments** (slot 4) |
-| +12 | text: brand ("suzuki", "kia") |
-| +14 | text: street ("ulica powstancow slaskich") |
-| +16, +18 | text: city, city again (or municipality) |
-| +20 | text: country ("polska") |
-| +22, +24 | text, mostly 0 (open) |
-| +26 | text: **house number** ("194") |
-| +28 | u32, open (unique per POI, maybe an ID) |
-| +32 | text: **phone** ("+48-225331111") |
-| +34 | text: **postcode** ("01-466") |
-| +36, +38 | 0 |
-
-Slot 4 = 8-byte access segments: `u32 table 1 parcel pointer, u16 segment offset, u16 side`
-(0 / 1; probably left / right of the segment). Checked: 143 of 147 segments carry the POI's street.
-
-### Street entries in detail (table f; **checked** on Piaseczno)
-
-- Entry `+0 name, +2 flags, +4 settlement text (0 = the whole city), +6 offset of its run`; a gmina
-  has for every street one entry for the whole gmina plus one per settlement, a settlement city
-  one per street. Every name has **word rotations**: "ulica adama mickiewicza" (flags 0x12),
-  "adama mickiewicza ulica" and "mickiewicza ulica adama" (0x1012): the leading street word moves
-  to the cut, no rotation starts with a number.
-- Run (6 B): `u16 offset of the first item, u8 count, u8 1, u16 0`; runs may share items.
-- Item (24 B): `u32 lon, u32 lat` of the settlement / town, **even from / to, odd from / to**
-  (32767 none) over its segments, `u32 parcel, u16 offset of the first segment, u16 number of
-  consecutive segments` (one street of one class in one parcel).
-- Table d holds the gminas (municipality = powiat, "piaseczno" / "powiat piaseczynski") and the
-  settlements (municipality = their gmina, "nowa iwiczna" / "lesznowola"), each with its own street
-  trie. Units of d / f: 0x30-byte header (slots at 8, next / previous unit at 0x28 / 0x2c).
-  Trie units (c, e, 10, 12): 12-byte header (pointer, kind, 0, slot 0 = nodes at 0x0c).
-- `tests/check_search.py` walks country -> city -> street -> items like the device: the original
-  passes 99.9 % / 92 % (other-language names), the encoder output 100 %.
-
-### Table b: countries (block 4, kind 0x0a; **checked**) and table c (block 3)
-
-Slot 0 = name entries ("balgaria", "ceska republika", "eesti", "hrvatska", "latvija", "lietuva",
-"magyarorszag", "polska", "românia", "slovenija", "slovenska republika"; flags = language code as
-in d). Slot 1 = 56-byte **country records**:
-
-| Offset | Content |
-|---|---|
-| +0, +4, +6 | u32 table e pointer, offset, count: **root of the city name trie** of this country (Poland 0xd08 / 0x2514 / 23 nodes; Bulgaria 0x508 / 0x0c / 24) |
-| +8..+22 | four u32 11, 22, 33, 44 (same for all; open) |
-| +24, +26 | offset, count of the **country-wide POI category entries** (slot 3, the city slot 3 format: attractions 20, museums 32, airports 52 …) |
-| +28..+34 | 500, 300, 1000, 500 (same for all; open) |
-| +38 | 1 for cz, sk, else 0 (open) |
-| +40 | u16 country number (bg 33, cz 56, ee 67, hr 53, lv 117, lt 123, hu 97, pl 171, ro 176, si 191, sk 190; open) |
-| +46 | **ISO 3166 code**, 2 characters ("pl") |
-
-Table c (block 3, kind 0x0b) = the country name trie (one node per first letter, into b).
-
-### Table 17: database info (block 1, kind 0x13)
-
-Key / value texts: "content" eastern-europe, "supplier", "conv tool version", "name" eeu_nok_nok_12q4_20130205p
-(Navteq 2012 Q4, converted 2013-02-05), "conv tool version" prod_20130205/nok2012q2, "gdf version" 2.1, "tmc included", "conversion by" dbconv, "conditional access"
-false. Block 0 holds the same header fields as block 1.
-
-### Table 18: TMC location table (kind 0x17; not decoded)
-
-Czech TMC locations (regions "Jihomoravský kraj", junctions "propojka", "nájezd"): RDS-TMC only,
-not needed.
-
-## 8. For the encoder
-
-What a writer must produce, by what we know:
-1. Block 0: header fields above, record size table (copy), table directory, texts; block 1-4
-   small tables (info, index directory, country trie, countries).
-2. Routing level 0 parcels: a quadtree of boxes (64-unit grid, sizes 32 768 · 2^k units). A road
-   becomes segments between nodes (junctions, attribute changes, parcel border crossings); the
-   bends in between are the segment's shape points (slot 7). Per
-   segment: end nodes, shape points, node rings (+6/+8), one-way, length, headings, class, form of
-   way, figure / access nibbles, paved flag, access code, prohibited turns (slot 10), attributes
-   (slot 12: ferry minutes), signposts (slot 11, optional), place record (slots 0-2). Nodes: node
-   byte (type, inside / edge, top level c). Edge points in pairs with the neighbour parcel (slot 6),
-   neighbour list (slot 9). House number unit (kind 4) per parcel, pointer at 0x54.
-3. Routing levels 1-3: subsets of the level below (nodes at identical coordinates, marked by c in
-   the node byte; a coarse segment = the shortest path below, same length), parent pointers
-   (0x58), child grid (slot 8, cell size at 0x5c), header constants (0x60-0x70). Simplest start:
-   level 1-3 with only class 0-2 / 0-1 / 0 roads, as the original does.
-4. Then the bit-level compression (inverse of section 3), or uncompressed units (allowed: 1 240
-   parcels are stored uncompressed).
-5. Background units (areas, generalised roads) on 6 levels, POI units + table 11 names and details,
-   search indexes (countries b/c, cities d/e, street tries 10, streets f, POI letter lists 12),
-   the spatial index parts of every table (section 2) and the block 2 index directory.
-6. Verification: decode the output with `decoder.py` and compare; then run it in the emulator
-   (the map draws when the car position is set manually).
-
-Open items (none of them blocks routing as far as the router code shows): slot 3 (pairs of
-offsets), flags of slot 6 (+6), slot 9 (+4, +6) and slot 7 (+4); node type values 1 and 2;
-segment +10 bits 0-6, +11 bit 6, +16 bit 7 (copied by the router, use not found), the exact
-meaning of figures 5 / 7 / 9 and of the access codes 1-6; parcel +0x60 / 0x64 / 0x68 / 0x70 on
-level 0; house number scheme 1; table 11 +22 / +24 / +28; country record +8..+40; POI +16; the
-index directory's `a` field and zoom unit. Not needed: tables 0 and 18, slot 12 types 6-8 (TMC).
-
-## 9. Tools and workflow
+## 12. Tools and reverse engineering
 
 - `tools/extract_navdb.py`: disc image → `temp/navdb/` (carindb, CARINET, …).
 - `tools/carindb_header.py`: block 0 dump.
+- `decoder.py`, `encoder.py`, `tools/mkdisc.py` and `tests/*`: see `../README.md`.
 - `decoder.py [carindb] [-o out.gpkg] [--area NAME | --bbox lon0,lat0,lon1,lat1] [--layers …] [--info]`: layers `parcels`,
   `roads`, `areas`, `overview_roads`, `poi` (with address / phone / postcode), `cities`; RTree
   index; QGIS styles in `layer_styles`.
@@ -567,20 +515,21 @@ index directory's `a` field and zoom unit. Not needed: tables 0 and 18, slot 12 
   The script creates functions from `link a5` prologues and sets the Microware calling convention
   (D0, D1, then stack). Module files: `re-safrane/extracted/flash_0209/*.mod`; copies in
   `temp/navdb/mods/`. Do not use `export_os9_modules.py` there: it deletes
-  `temp/ghidra/OS9_Batch_Project`.
+  `temp/ghidra/OS9_Batch_Project`. Ghidra stops at the math trap (`trap #15` + a function word);
+  `tools/ghidra/dis68k.py` disassembles such ranges with capstone.
 - Router: `rpmod` (`temp/extracted/flash_0209/065_rpmod.mod`, copy in `temp/navdb/mods/`) has
   its own copy of the db access library; record size table at data 0x168 (`annotate_dbq.py
   --base 0x168` → `ghidra_out/065_rpmod.annotated.md`, index `rpmod_index.txt`). Key functions:
   `FUN_0000ce00` segment → edge record, `FUN_0000c58e` node ring / edge point walk,
   `FUN_0000b93a` / `FUN_0000b8ae` successors, `FUN_0000bb24` prohibited turn check, `FUN_0000bd04`
-  access check, `FUN_0000b148` travel time, `FUN_0000b2d6` turn cost, `FUN_00001d02` cost tables
-  (math via `trap #15` + function word: disassemble with capstone, Ghidra stops there),
-  `FUN_00015eb6` node goes up a level, `FUN_000151cc` house number search, `FUN_0001d28a` /
-  `FUN_0001d2e4` / `FUN_0001d364` slot 10 / 12 / 11 ranges. dbq is a server: request dispatcher
-  `FUN_00006dbc` (codes 0xc8.. → handlers; 0xc8 = slot 10 of a segment, 0xd5 = segment walk).
+  access check, `FUN_0000b148` travel time, `FUN_0000b2d6` turn cost, `FUN_00001d02` cost tables,
+  `FUN_00015eb6` node goes up a level, `FUN_000151cc` house number search, `FUN_000195e2` header
+  travel times, `FUN_0001d28a` / `FUN_0001d2e4` / `FUN_0001d364` slot 10 / 12 / 11 ranges. dbq is a
+  server: request dispatcher `FUN_00006dbc` (codes 0xc8.. → handlers; 0xc8 = slot 10 of a segment,
+  0xd5 = segment walk).
 - Key functions: pbp `FUN_00003508` dispatch, `FUN_00003eb2` parcel, `FUN_000035de`..`FUN_00003e8a`
   parcel slots, `FUN_00004840`/`FUN_000044a2` background, `FUN_00004abc` text, `FUN_00004c16` bit
   reader, `FUN_000049f2` setup, `FUN_00004a34`/`FUN_00004a5a` raw copies, `FUN_0000325c` record
   sizes, read loop at 0x11fc; dbq `FUN_000128d4` get unit (via pbp), `FUN_00012834` release,
-  `FUN_00001890` segment walk, `FUN_00014dc4`/`FUN_00014f60` record sizes, `FUN_0000c5fa`/`c74c`
-  record search by letter.
+  `FUN_00001890` segment walk, `FUN_000149ba` shape points, `FUN_00004cfc` signposts,
+  `FUN_00014dc4`/`FUN_00014f60` record sizes, `FUN_0000c5fa`/`c74c` record search by letter.

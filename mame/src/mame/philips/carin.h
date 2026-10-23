@@ -6,6 +6,7 @@
 
 #include "machine/mc68681.h"
 #include "machine/intelfsh.h"
+#include "machine/ram.h"
 #include "cpu/m68000/m68030.h"
 #include "cdislavehle.h"
 #include "cdicdic.h"
@@ -39,6 +40,7 @@ public:
 		, m_flash(*this, "flash%u", 0U)
 		, m_bootflash(*this, "bootflash")
 		, m_bootflash2(*this, "bootflash2")
+		, m_ram(*this, "ram")
 		, m_car_controls(*this, "CAR")
 		, m_ignition_led(*this, "ignition")
 		, m_car_input(*this, "CAR_KEYS")
@@ -69,6 +71,7 @@ private:
 	// Boot flash (bootrom, flsh_boot, flsh_voice, flsh_slave2): two byte-wide 1 MB chips at 0x000000.
 	required_device<amd_29f080_device> m_bootflash;    // 0x000000, bootrom at the bottom
 	required_device<amd_29f080_device> m_bootflash2;   // 0x100000, ends with flsh_slave2/flsh_hdr
+	required_device<ram_device> m_ram;                  // system RAM, then the Extension RAM if fitted
 	uint32_t m_mcasic_regs[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00000040 };
 	uint8_t m_mcasic_reg12 = 0x10;
 	bool m_mcasic_mock_pending = false;

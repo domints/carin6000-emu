@@ -114,17 +114,16 @@ void carin_state::carin_mem(address_map &map)
     map(0x320000, 0x323fff).rw("mk48t08", FUNC(timekeeper_device::read), FUNC(timekeeper_device::write)).umask16(0xff00);
 
 	// VSC (SCC66470): its 2 MB space sits at 0x600000 with the registers at the top (0x7fffe0);
-	// 512 KB of DRAM at 0x600000 (display program at 0x6003ec, frame buffer allocated by videodr).
+	// 1 MB of DRAM at 0x600000. The first 512 KB is the init module's "Video RAM" (display program
+	// at 0x6003ec, frame buffer allocated by videodr), the second its "Development RAM" (0x680000),
+	// which a real unit (hardware 0209 without Extension RAM) lists as free memory.
 	// The pixel accelerator window mirrors the DRAM 16 MB higher (videodr reports the offset).
 	map(0x600000, 0x7fffff).m(m_vsc, FUNC(scc66470_device::map));
-	map(0x600000, 0x67ffff).rw(FUNC(carin_state::vsc_dram_r), FUNC(carin_state::vsc_dram_w));
-	map(0x1600000, 0x167ffff).rw(m_vsc, FUNC(scc66470_device::ipa_r), FUNC(scc66470_device::ipa_w));
+	map(0x600000, 0x6fffff).rw(FUNC(carin_state::vsc_dram_r), FUNC(carin_state::vsc_dram_w));
+	map(0x1600000, 0x16fffff).rw(m_vsc, FUNC(scc66470_device::ipa_r), FUNC(scc66470_device::ipa_w));
 
-	// Main system RAM (2 MiB)
-	map(0x800000, 0x9effff).ram();
-	// "Extension RAM" from the init module's memory list (2 MB); the navigation with a map disc
-	// needs it (without it device_dialog cannot be forked and dbd runs out of heap).
-	map(0xa00000, 0xbfffff).ram();
+	// Main system RAM (0x800000-0x9effff) and the "Extension RAM" (0xa00000-0xbfffff) come from the
+	// RAM device, installed in machine_start: the RAM slot at 4m fits both, -ram 2m only the system RAM.
 	map(0x9f0000, 0x9fffff).rw(FUNC(carin_state::carin_slave_r), FUNC(carin_state::carin_slave_w));
 	map(0xf00000, 0xf0003f).rw(FUNC(carin_state::carin_arcnet_r), FUNC(carin_state::carin_arcnet_w));
 
@@ -173,8 +172,16 @@ void carin_state::carin_mem(address_map &map)
 
 void carin_state::machine_start()
 {
-	m_vram = std::make_unique<uint16_t[]>(0x80000 / 2);
-	save_pointer(NAME(m_vram), 0x80000 / 2);
+	m_vram = std::make_unique<uint16_t[]>(0x100000 / 2);
+	save_pointer(NAME(m_vram), 0x100000 / 2);
+
+	// The Extension RAM is an option: some units have none (seen on a real 0209), and the OS-9
+	// memory probe then finds nothing at 0xa00000. The navigation with a map disc needs it (without it
+	// device_dialog cannot be forked and dbd runs out of heap).
+	address_space &program = m_maincpu->space(AS_PROGRAM);
+	program.install_ram(0x800000, 0x9effff, m_ram->pointer());
+	if (m_ram->size() > 0x200000)
+		program.install_ram(0xa00000, 0xbfffff, m_ram->pointer() + 0x200000);
 	save_item(NAME(m_mcasic_regs));
 	save_item(NAME(m_mcasic_reg12));
 	save_item(NAME(m_mcasic_mock_pending));
@@ -1186,7 +1193,7 @@ void carin_state::vram_w(offs_t offset, uint16_t data, uint16_t mem_mask)
 
 void carin_state::vsc_map(address_map &map)
 {
-	map(0x00000, 0x7ffff).rw(FUNC(carin_state::vram_r), FUNC(carin_state::vram_w));
+	map(0x00000, 0xfffff).rw(FUNC(carin_state::vram_r), FUNC(carin_state::vram_w));
 }
 
 void carin_state::placeholder_palette(palette_device &palette) const
@@ -1285,6 +1292,7 @@ void carin_state::carin(machine_config &config)
 		AMD_29F040(config, m_flash[i]);
 	AMD_29F080(config, m_bootflash);
 	AMD_29F080(config, m_bootflash2);
+	RAM(config, m_ram).set_default_size("4M").set_extra_options("2M").set_default_value(0);
 }
 
 ROM_START( carin )

@@ -123,6 +123,40 @@ os9_srqmem:
 1:	move.l	(%sp)+,%a2
 	bra.w	error
 
+| int os9_srtmem(unsigned size, void *block): gives back a block from os9_srqmem
+	.globl	os9_srtmem
+os9_srtmem:
+	move.l	%a2,-(%sp)
+	move.l	8(%sp),%d0
+	move.l	12(%sp),%a2
+	trap	#0
+	.short	0x0029			| F$SRtMem
+	move.l	(%sp)+,%a2
+	bcs.w	error
+	moveq	#0,%d0
+	rts
+
+| int os9_gblkmp(void *map, unsigned size, unsigned *out): free memory map (address, size pairs)
+| without allocating; out[0] fragments, out[1] total RAM, out[2] free RAM. Returns 0 or -error.
+	.globl	os9_gblkmp
+os9_gblkmp:
+	movem.l	%d2-%d3,-(%sp)
+	move.l	12(%sp),%a0
+	move.l	16(%sp),%d1
+	moveq	#0,%d0			| from address 0
+	trap	#0
+	.short	0x0019			| F$GBlkMp
+	bcs.s	1f
+	move.l	20(%sp),%a0
+	move.l	%d1,(%a0)+
+	move.l	%d2,(%a0)+
+	move.l	%d3,(%a0)
+	movem.l	(%sp)+,%d2-%d3
+	moveq	#0,%d0
+	rts
+1:	movem.l	(%sp)+,%d2-%d3
+	bra.w	error
+
 | unsigned os9_ticks(unsigned *rate): ticks since midnight (F$Time, Julian with ticks), *rate per second
 	.globl	os9_ticks
 os9_ticks:

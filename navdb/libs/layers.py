@@ -16,7 +16,8 @@ Layers:
   areas    background areas (tables 6, 16, 15, 1c, 14, 1d = levels 0-5, finer to coarser, zoom
            ranges in the block 2 index directory; slot 1 records): type (slot 0 groups), name,
            area in m2 (+4)
-  overview_roads  the generalised road network of the same tables (slot 2 records), name = road number
+  overview_roads  the lines of the same tables (slot 2 records): type (slot 0 groups of kind 1: 101
+           rivers, 102 railways, 104-106 roads by importance), name (road number, river), length
   poi      table 7 units (28-byte records): position (16-bit steps of 64 GPS units from the unit box),
            category (+10), brand (+12, text in the unit), name (+0 unit pointer, +4 offset of an
            8-byte name entry in table 11); street, house number, district, city, postcode and phone
@@ -192,7 +193,9 @@ POI_CATEGORIES = {
 }
 
 
-AREA_TYPES = {1: "woda", 3: "las / park", 5: "zabudowa", 6: "cmentarz", 8: "wyspa"}
+AREA_TYPES = {1: "woda", 3: "las / park", 5: "zabudowa", 6: "cmentarz", 8: "wyspa / ląd"}
+LINE_TYPES = {101: "rzeka / kanał", 102: "kolej", 103: "granica?", 104: "droga główna", 105: "droga krajowa",
+              106: "droga wojewódzka"}
 BACKGROUND_LEVELS = ((6, 0), (0x16, 1), (0x15, 2), (0x1C, 3), (0x14, 4), (0x1D, 5))
 
 
@@ -203,8 +206,8 @@ def background(f, gp, tables, bbox, sizes, release, progress):
     pointer (+2) to the next record's. Slot 0 groups the slot 1 records by type."""
     gp.layer("areas", "POLYGON", [("level", "INTEGER"), ("type", "INTEGER"), ("type_name", "TEXT"),
                                   ("name", "TEXT"), ("area_m2", "INTEGER"), ("block", "INTEGER")])
-    gp.layer("overview_roads", "LINESTRING", [("level", "INTEGER"), ("name", "TEXT"), ("attr", "INTEGER"),
-                                              ("block", "INTEGER")])
+    gp.layer("overview_roads", "LINESTRING", [("level", "INTEGER"), ("type", "INTEGER"), ("type_name", "TEXT"),
+                                              ("name", "TEXT"), ("length_m", "INTEGER"), ("block", "INTEGER")])
     unpacker = Unpacker(sizes, release, TEXT_TABLES, block_size(f))
     for tid, level in BACKGROUND_LEVELS:
         na = nr = 0
@@ -243,15 +246,15 @@ def background(f, gp, tables, bbox, sizes, release, progress):
 
             g_off, g_cnt = w(8), w(10)
             g_cnt = max(0, min(g_cnt, (len(d) - g_off) // 4 - 1))
-            groups = [(d[g_off + 4 * i], w(g_off + 4 * i + 2)) for i in range(g_cnt + 1)]
+            groups = [(d[g_off + 4 * i], d[g_off + 4 * i + 1], w(g_off + 4 * i + 2)) for i in range(g_cnt + 1)]
             off, cnt, rs = w(12), w(14), sizes[0x3A]
             cnt = max(0, min(cnt, (len(d) - off) // rs))
             for i in range(cnt):
                 r = off + i * rs
                 typ = None
-                for k in range(g_cnt):
-                    if groups[k][1] <= r and (k == g_cnt - 1 or r < groups[k + 1][1]):
-                        typ = groups[k][0]
+                for gt, kind, go in groups[:g_cnt]:
+                    if kind == 0 and go <= r:
+                        typ = gt
                 pts = shape(r, rs)
                 if len(pts) >= 3:
                     gp.add("areas", pts, (level, typ, AREA_TYPES.get(typ), cstring(d, w(r)),
@@ -261,9 +264,14 @@ def background(f, gp, tables, bbox, sizes, release, progress):
             cnt = max(0, min(cnt, (len(d) - off) // rs))
             for i in range(cnt):
                 r = off + i * rs
+                typ = None                  # slot 0 groups of kind 1 cover the lines
+                for gt, kind, go in groups[:g_cnt]:
+                    if kind == 1 and go <= r:
+                        typ = gt
                 pts = shape(r, rs)
                 if len(pts) >= 2:
-                    gp.add("overview_roads", pts, (level, cstring(d, w(r)), struct.unpack_from(">I", d, r + 4)[0], b))
+                    gp.add("overview_roads", pts, (level, typ, LINE_TYPES.get(typ), cstring(d, w(r)),
+                                                   struct.unpack_from(">I", d, r + 4)[0], b))
                     nr += 1
         progress.finish(f"background, level {level} (table {tid:x}): {na} areas, {nr} roads")
 

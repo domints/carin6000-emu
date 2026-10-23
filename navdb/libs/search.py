@@ -1,6 +1,7 @@
 """Search tables for the encoder (docs/format.md section 7): countries (b, block 4) and their name
 trie (c, block 3), city name trie (e), cities (d), street tries per city (10), streets with house
-number ranges (f). POI tables (7, 11, 12) are left empty for now.
+number ranges (f). The POI tables (7, 11, 12) come from libs/osmpoi.py; here the cities and the
+country get their POI category lists (d slot 3, block 4 slot 3).
 
 Cities are the gminas (municipality = powiat) and the settlements (municipality = gmina), as in
 the original; a gmina's streets have one entry for the whole gmina plus one per settlement, a
@@ -13,10 +14,19 @@ from dataclasses import dataclass, field
 
 from .carindb import BLOCK
 
-LANG = 0x12              # Polish
+LANG = 0x12              # Polish; set_language() for other countries
 ROTATED = 0x1000
 LEAF_MAX = 150           # a trie node becomes a leaf at this many entries (original leaves: up to ~160)
 UNIT_MAX = 8 * BLOCK
+
+
+def set_language(lang, street_words):
+    """Name flags and street rotation rule of the country being encoded."""
+    global LANG, STREET_FIRST
+    LANG, STREET_FIRST = lang, street_words
+
+
+STREET_FIRST = True      # streets start with a street word ("ulica ...") that moves in rotations
 
 
 def rotations(name, street=True):
@@ -24,6 +34,7 @@ def rotations(name, street=True):
     the rotation cuts; no rotation starts with a number."""
     words = name.split()
     out = [(name, LANG)]
+    street = street and STREET_FIRST
     if street and len(words) >= 2:
         head, rest = words[0], words[1:]
         for i in range(len(rest)):
@@ -36,7 +47,7 @@ def rotations(name, street=True):
     return out
 
 
-@dataclass(eq=False)
+@dataclass(eq=False, slots=True)
 class Item:
     """A run of consecutive segments of one street in one parcel (table f slot 2)."""
     pos: tuple                     # position of the settlement / town (GPS units)
@@ -54,6 +65,7 @@ class City:
     seg: tuple                     # (parcel, segment index) of the city's destination segment
     entries: list = field(default_factory=list)   # [(name, flags, settlement or None, [Item])]
     roots: object = None           # trie node list (set by the builder)
+    poi: list = field(default_factory=list)       # [(category, list key)] (libs/osmpoi.py)
 
 
 def _numbers(pieces):
@@ -125,9 +137,11 @@ class Node:
     children: list = None
 
 
-def trie(names, depth=0, lo=0, hi=None):
-    """Node list for names[lo:hi] (sorted) at this depth."""
+def trie(names, depth=0, lo=0, hi=None, leaf_max=None, weights=None, max_weight=None):
+    """Node list for names[lo:hi] (sorted) at this depth. A node becomes a leaf at leaf_max names
+    and, with weights (bytes per name), max_weight bytes, unless its names cannot be split."""
     hi = len(names) if hi is None else hi
+    leaf_max = leaf_max or LEAF_MAX
     nodes = []
     i = lo
     while i < hi:
@@ -135,11 +149,13 @@ def trie(names, depth=0, lo=0, hi=None):
         j = i
         while j < hi and (names[j][depth] if depth < len(names[j]) else " ") == ch:
             j += 1
-        exhausted = any(depth + 1 >= len(names[k]) for k in range(i, j))
-        if j - i <= LEAF_MAX or exhausted or depth > 30:
+        # a group can only be split while its names differ ("muzeum" and "muzeum narodowe" can)
+        exhausted = names[i] == names[j - 1] if j - i > leaf_max else any(depth + 1 >= len(names[k]) for k in range(i, j))
+        light = weights is None or sum(weights[i:j]) <= max_weight
+        if (j - i <= leaf_max and light) or exhausted or depth > 30:
             nodes.append(Node(ord(ch), True, i, j - i))
         else:
-            kids = trie(names, depth + 1, i, j)
+            kids = trie(names, depth + 1, i, j, leaf_max, weights, max_weight)
             nodes.append(Node(ord(ch), False, i, len(kids), kids))
         i = j
     return nodes
@@ -187,6 +203,7 @@ class NameUnit:
     def __init__(self, kind):
         self.kind, self.rows, self.texts = kind, [], Texts()
         self.n_runs = self.n_items = 0
+        self.cities = {}                    # d: city -> its POI category records (in slot 3)
 
     def size_with(self, rows):
         e = len(self.rows) + len(rows)
@@ -195,7 +212,9 @@ class NameUnit:
             items = self.n_items + sum(len(r[3]) for r in rows)
             body = _a4(0x30 + 8 * e) + _a4(6 * runs) + 24 * items
         else:
-            body = _a4(0x30 + 8 * e) + 24 * e
+            new = {id(r[3]): r[3] for r in rows if id(r[3]) not in self.cities}
+            cats = sum(len(c.poi) for c in self.cities.values()) + sum(len(c.poi) for c in new.values())
+            body = _a4(0x30 + 8 * e) + 24 * e + 12 * cats
         texts = Texts()
         texts.order, texts.size = list(self.texts.order), self.texts.size
         for r in rows:
@@ -210,6 +229,8 @@ class NameUnit:
             self.texts.add(r[2])
             self.n_runs += 1
             self.n_items += len(r[3]) if self.kind == 0x0E else 0
+            if self.kind == 0x0C:
+                self.cities.setdefault(id(r[3]), r[3])
 
 
 def pack(groups, kind):
@@ -227,18 +248,25 @@ def pack(groups, kind):
     return units
 
 
-def name_unit_bytes(u, own, nxt, prv, parcel_ptr, record):
-    """Bytes of a d / f unit. record(row, texts) -> record bytes (24 B city record, or the f run
-    and items, handled here)."""
+def name_unit_bytes(u, own, nxt, prv, parcel_ptr, record, poi_list=None):
+    """Bytes of a d / f unit. record(payload, category slot offset, count) -> the 24-byte city
+    record (the f run and items are handled here); poi_list(key) -> (table 12 unit, offset, count)
+    of a POI list."""
     off = {}
     n = len(u.rows)
     o_runs = _a4(0x30 + 8 * n)
+    cat_at = {}
     if u.kind == 0x0E:
         o_items = _a4(o_runs + 6 * n)
         o_text = o_items + 24 * sum(len(r[3]) for r in u.rows)
     else:
         o_items = None
-        o_text = o_runs + 24 * n
+        o_cats = o_runs + 24 * n
+        pos = o_cats
+        for key, c in u.cities.items():
+            cat_at[key] = pos
+            pos += 12 * len(c.poi)
+        o_text = pos                        # slot 5 (brand lists) stays empty, here
     pos = o_text
     for t in u.texts.order:
         off[t] = pos
@@ -248,8 +276,11 @@ def name_unit_bytes(u, own, nxt, prv, parcel_ptr, record):
         struct.pack_into(">IHHHHHHHH", d, 0, own, u.kind, 0, 0x30, n, o_runs, n, o_items,
                          sum(len(r[3]) for r in u.rows))
     else:
-        struct.pack_into(">IHHHHHHHHHHHH", d, 0, own, u.kind, 0, 0x30, n, o_runs, n, 0, 0,
-                         o_text, 0, 0, 0)
+        struct.pack_into(">IHHHHHHHHHHHHHH", d, 0, own, u.kind, 0, 0x30, n, o_runs, n, 0, 0,
+                         o_cats, sum(len(c.poi) for c in u.cities.values()), 0, 0, o_text, 0)
+        for key, c in u.cities.items():
+            for k, (cat, lst) in enumerate(c.poi):
+                struct.pack_into(">IHHHH", d, cat_at[key] + 12 * k, *poi_list(lst), cat, o_text)
     struct.pack_into(">II", d, 0x28, nxt, prv)
     item_pos = o_items
     for i, r in enumerate(u.rows):
@@ -263,19 +294,41 @@ def name_unit_bytes(u, own, nxt, prv, parcel_ptr, record):
                                  parcel_ptr(it.parcel), it.parcel.seg_base + 32 * it.seg_index, it.count)
                 item_pos += 24
         else:
-            d[rec:rec + 24] = record(payload)
+            d[rec:rec + 24] = record(payload, cat_at[id(payload)], len(payload.poi))
     for t, o in off.items():
         d[o:o + len(t)] = t.encode("latin1")
     return bytes(d)
 
 
-def trie_unit_bytes(own, kind, lists, place):
-    """Bytes of a table 10 / e / c unit holding node lists; place(node) -> (ptr, off, count) for a
-    leaf; children lists are in the same unit."""
+def pack_lists(roots):
+    """Node lists of many tries spread over units of at most UNIT_MAX: a trie starts a new unit
+    when it does not fit the current one, a list never spans units (children may sit in another
+    unit: an inner node holds their unit pointer). Returns ([[list]] per unit, {id(list): (unit,
+    offset)})."""
+    units, where, size = [[]], {}, 0x0C
+    for root in roots:
+        lists = node_lists(root)
+        if units[-1] and size + 12 * sum(len(lst) for lst in lists) > UNIT_MAX:
+            units.append([])
+            size = 0x0C
+        for lst in lists:
+            if size + 12 * len(lst) > UNIT_MAX:
+                units.append([])
+                size = 0x0C
+            where[id(lst)] = (len(units) - 1, size)
+            units[-1].append(lst)
+            size += 12 * len(lst)
+    return units, where
+
+
+def trie_unit_bytes(own, kind, lists, place, child=None):
+    """Bytes of a table 10 / e / c / 12 unit holding node lists; place(node) -> (ptr, off, count)
+    for a leaf; child(list) -> (ptr, off) of an inner node's children (default: in this unit)."""
     start, pos = {}, 0x0C
     for lst in lists:
         start[id(lst)] = pos
         pos += 12 * len(lst)
+    child = child or (lambda lst: (own, start[id(lst)]))
     d = bytearray(-(-pos // BLOCK) * BLOCK)
     struct.pack_into(">IHHHH", d, 0, own, kind, 0, 0x0C, (pos - 0x0C) // 12)
     for lst in lists:
@@ -285,21 +338,33 @@ def trie_unit_bytes(own, kind, lists, place):
                 ptr, off, cnt = place(nd)
                 struct.pack_into(">IBBHHH", d, o, ptr, nd.char, 1, off, cnt, 0)
             else:
-                struct.pack_into(">IBBHHH", d, o, own, nd.char, 0, start[id(nd.children)], len(nd.children), 0)
+                ptr, off = child(nd.children)
+                struct.pack_into(">IBBHHH", d, o, ptr, nd.char, 0, off, len(nd.children), 0)
             o += 12
     return bytes(d), start
 
 
-def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr):
+def trie_table(units, where, prefix, kind, place, Unit):
+    """The units of a trie table from pack_lists(); unit keys (prefix, n)."""
+    def build(resolve, n):
+        child = lambda lst: (resolve((prefix, where[id(lst)][0])), where[id(lst)][1])
+        return trie_unit_bytes(resolve((prefix, n)), kind, units[n], place, child)[0]
+    return [Unit((prefix, n), lambda resolve, n=n: build(resolve, n)) for n in range(len(units))]
+
+
+def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr, poi_list=None,
+               country_poi=()):
     """Registers tables e, d, 10, f and blocks 3 / 4 in a dbwrite.Database. template_country = the
     56-byte country record of the original (fields not known are kept); parcel_ptr(parcel) gives a
-    level 0 parcel's unit pointer."""
+    level 0 parcel's unit pointer; poi_list(key) -> (table 12 unit, offset, count) of a POI list
+    named in City.poi or country_poi ([(category, key)], the country-wide lists)."""
     cities = sorted(cities, key=lambda c: (c.name, c.muni))
     # f: street entries per city, leaves kept in one unit
     f_groups, f_leaf = [], {}
     for c in cities:
         names = [r[0] for r in c.entries]
-        c.trie = trie(names)
+        weights = [8 + 6 + 24 * min(len(r[3]), 255) + len(r[0]) + 1 for r in c.entries]
+        c.trie = trie(names, weights=weights, max_weight=UNIT_MAX * 3 // 4)
         for leaf in leaves(c.trie):
             f_leaf[id(leaf)] = len(f_groups)
             f_groups.append(c.entries[leaf.first:leaf.first + leaf.count])
@@ -317,18 +382,13 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr):
         ui_, row = placement[f_leaf[id(leaf)]]
         return db.resolve(f_keys[ui_]), 0x30 + 8 * row, leaf.count
 
-    # 10: one unit per city with its node lists
-    t10_units = []
-    for k, c in enumerate(cities):
-        lists = node_lists(c.trie)
-        c.t10_key = ("t10", k)
-        c.t10_lists = lists
-        t10_units.append(Unit(c.t10_key, lambda resolve, lists=lists, key=c.t10_key:
-                              trie_unit_bytes(resolve(key), 0x0F, lists, f_place)[0]))
+    # 10: the street tries of many cities share units
+    t10_lists, t10_where = pack_lists([c.trie for c in cities])
+    t10_units = trie_table(t10_lists, t10_where, "t10", 0x0F, f_place, Unit)
 
     def roots_of(c):
-        _, start = trie_unit_bytes(0, 0x0F, c.t10_lists, lambda nd: (0, 0, 0))
-        return db.resolve(c.t10_key), start[id(c.t10_lists[0])], len(c.t10_lists[0])
+        u, off = t10_where[id(c.trie)]
+        return db.resolve(("t10", u)), off, len(c.trie)
 
     # d: city name rows (with rotations), one city record per row
     rows = []
@@ -354,10 +414,10 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr):
         ui_, row = d_place[d_leaf[id(leaf)]]
         return db.resolve(d_keys[ui_]), 0x30 + 8 * row, leaf.count
 
-    def city_record(c, slot3):
+    def city_record(c, slot3, count):
         root_ptr, root_off, root_n = roots_of(c)
         parcel, idx = c.seg
-        return struct.pack(">IHHHHIH6x", root_ptr, root_off, root_n, slot3, 0, parcel_ptr(parcel),
+        return struct.pack(">IHHHHIH6x", root_ptr, root_off, root_n, slot3, count, parcel_ptr(parcel),
                            parcel.seg_base + 32 * idx)
 
     def name_units(units, keys, kind, record):
@@ -366,33 +426,33 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr):
             def build(resolve, i=i, u=u):
                 nxt = resolve(keys[i + 1]) if i + 1 < len(units) else 0
                 prv = resolve(keys[i - 1]) if i else 0
-                return name_unit_bytes(u, resolve(keys[i]), nxt, prv, parcel_ptr, record(u))
+                return name_unit_bytes(u, resolve(keys[i]), nxt, prv, parcel_ptr, record, poi_list)
             out.append(Unit(keys[i], build))
         return out
 
-    def d_record(u):
-        n = len(u.rows)
-        o_text = _a4(0x30 + 8 * n) + 24 * n
-        return lambda c: city_record(c, o_text)
-
-    db.add(Table(0x0F, name_units(f_units, f_keys, 0x0E, lambda u: None)))
+    db.add(Table(0x0F, name_units(f_units, f_keys, 0x0E, None)))
     db.add(Table(0x10, t10_units))
-    db.add(Table(0x0D, name_units(d_units, d_keys, 0x0C, d_record)))
-    e_lists = node_lists(d_trie)
-    db.add(Table(0x0E, [Unit(("e", 0), lambda resolve: trie_unit_bytes(resolve(("e", 0)), 0x0D, e_lists, d_place_of)[0])]))
+    db.add(Table(0x0D, name_units(d_units, d_keys, 0x0C, city_record)))
+    e_lists, e_where = pack_lists([d_trie])
+    db.add(Table(0x0E, trie_table(e_lists, e_where, "e", 0x0D, d_place_of, Unit)))
 
     # blocks 3 (country trie) and 4 (countries)
     name, number, iso = country
+    template_number = struct.unpack_from(">H", template_country, 40)[0]
 
     def block4(resolve):
-        _, start = trie_unit_bytes(0, 0x0D, e_lists, lambda nd: (0, 0, 0))
         d = bytearray(BLOCK)
-        rec, txt = 0x38, 0x38 + 56
-        struct.pack_into(">IHHHHHHHHHHHH", d, 0, 4 << 8 | 1, 0x0A, 0, 0x30, 1, rec, 1, 0, 0, txt, 0, 0, 0)
+        rec, cats = 0x38, 0x38 + 56
+        txt = cats + 12 * len(country_poi)
+        struct.pack_into(">IHHHHHHHHHHHH", d, 0, 4 << 8 | 1, 0x0A, 0, 0x30, 1, rec, 1, 0, 0, cats,
+                         len(country_poi), 0, 0)
         struct.pack_into(">HHHH", d, 0x30, txt, LANG, 0, rec)
+        for k, (cat, lst) in enumerate(country_poi):
+            struct.pack_into(">IHHHH", d, cats + 12 * k, *poi_list(lst), cat, txt)
         r = bytearray(template_country)
-        struct.pack_into(">IHH", r, 0, resolve(("e", 0)), start[id(e_lists[0])], len(e_lists[0]))
-        struct.pack_into(">HH", r, 24, txt, 0)
+        u, off = e_where[id(d_trie)]
+        struct.pack_into(">IHH", r, 0, resolve(("e", u)), off, len(d_trie))
+        struct.pack_into(">HH", r, 24, cats, len(country_poi))
         struct.pack_into(">H", r, 40, number)
         r[46:48] = iso.encode()
         d[rec:rec + 56] = r
@@ -407,4 +467,4 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr):
 
     db.blocks[3], db.blocks[4] = block3, block4
     db.country_roots = 1                    # block 0 names the country trie root (block 3, 0x0c, count)
-    db.country_numbers = {number}           # block 2: per-country settings of our countries only
+    db.country_numbers = {number: template_number}    # block 2: settings of our country only

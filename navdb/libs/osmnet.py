@@ -49,11 +49,19 @@ def gps(lon, lat):
             round(lat / GPS_UNIT / POINT_STEP) * POINT_STEP)
 
 
+# Serbian Cyrillic -> Latin (Gaj), then folded like the rest; đ as "dj", as the original's
+# Croatian names ("djelo")
+CYRILLIC = dict(zip("абвгдђежзијклљмнњопрстћуфхцчџш",
+                    "a b v g d dj e z z i j k l lj m n nj o p r s t c u f h c c dz s".split()))
+LATIN = {"đ": "dj", "Đ": "Dj", "ł": "l", "Ł": "L"}
+
+
 def fold(text):
-    """Names as the original stores them: lower case ASCII ("Złota" -> "zlota")."""
+    """Names as the original stores them: lower case ASCII ("Złota" -> "zlota", "Кнеза Милоша"
+    -> "kneza milosa")."""
     if not text:
         return None
-    text = text.replace("ł", "l").replace("Ł", "L")
+    text = "".join(LATIN.get(ch) or CYRILLIC.get(ch.lower(), ch) for ch in text)
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     return re.sub(r" +", " ", re.sub(r"[^a-z0-9 ./]", " ", text.lower())).strip() or None
 
@@ -70,7 +78,7 @@ def metres(a, b):
     return math.hypot(dx, dy)
 
 
-@dataclass
+@dataclass(slots=True)
 class Road:
     """Segment attributes (one OSM way)."""
     name: str
@@ -88,7 +96,7 @@ class Road:
     settlement: str = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Edge:
     a: tuple             # start node (GPS units)
     b: tuple             # end node
@@ -106,8 +114,12 @@ class Network:
     nodes: dict = field(default_factory=dict)    # point -> list of edge indexes
 
 
-def road_attrs(highway, tags, name):
+def road_attrs(highway, tags, name, detail="normal"):
+    """CARiN attributes of an OSM road, None if it is left out. detail "normal" also leaves out
+    tracks and unnamed service roads (about half of all OSM roads; Navteq had few of them)."""
     if highway not in HIGHWAYS or (highway == "service" and tags.get("service") in SKIP_SERVICE):
+        return None
+    if detail == "normal" and (highway == "track" or (highway == "service" and not name)):
         return None
     cls, fow = HIGHWAYS[highway]
     oneway = {"yes": 1, "true": 1, "1": 1, "-1": 2, "reverse": 2}.get(tags.get("oneway"), 0)
@@ -152,17 +164,18 @@ def _linestring(blob):
     return [struct.unpack_from(order + "dd", wkb, 9 + 16 * i) for i in range(n)]
 
 
-def load(gpkg, bbox):
-    """Network of the roads whose bounding box lies in bbox (lon0, lat0, lon1, lat1)."""
-    db = sqlite3.connect(gpkg)
-    rows = db.execute(
+def load(gpkg, bbox, detail="normal"):
+    """Network of the roads whose bounding box lies in bbox (lon0, lat0, lon1, lat1); gpkg = one
+    GeoPackage or a list (rows deduplicated by OSM id)."""
+    from .osmsrc import rows as osm_rows
+    rows = osm_rows(gpkg,
         "SELECT l.osm_id, l.name, l.highway, l.other_tags, l.geom FROM lines l "
         "JOIN rtree_lines_geom r ON l.fid = r.id WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? "
         "AND r.miny <= ? AND l.highway IS NOT NULL", (bbox[0], bbox[2], bbox[1], bbox[3]))
     ways = []
     for osm_id, name, highway, other, geom in rows:
         tags = hstore(other)
-        road = road_attrs(highway, tags, name)
+        road = road_attrs(highway, tags, name, detail)
         if road is None:
             continue
         road.osm_id = osm_id

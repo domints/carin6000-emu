@@ -18,6 +18,9 @@
 
 
 #include "z_zone.h"
+#ifdef CARMINAT
+#include "carminat.h"
+#endif
 #include "i_system.h"
 #include "doomtype.h"
 
@@ -117,6 +120,42 @@ void Z_Init (void)
     block->tag = PU_FREE;
     
     block->size = mainzone->size - sizeof(memzone_t);
+
+#ifdef CARMINAT
+    // CARMINAT: the loader may hand over more RAM blocks than the first. Each one becomes a free
+    // block, after a "fence": a static block that takes the last bytes of the previous region, so
+    // that freeing never merges blocks of two regions (they do not touch).
+    {
+        unsigned i;
+        memblock_t *last = block;
+
+        for (i = 1; i < carminat_env->zone_count; i++)
+        {
+            memblock_t *fence, *region;
+
+            last->size -= sizeof(memblock_t);
+            fence = (memblock_t *)((byte *)last + last->size);
+            fence->size = sizeof(memblock_t);
+            fence->user = (void **)mainzone;
+            fence->tag = PU_STATIC;
+            fence->id = ZONEID;
+
+            region = (memblock_t *)carminat_env->zone[i].base;
+            region->size = carminat_env->zone[i].size;
+            region->user = NULL;
+            region->tag = PU_FREE;
+
+            last->next = fence;
+            fence->prev = last;
+            fence->next = region;
+            region->prev = fence;
+            region->next = &mainzone->blocklist;
+            mainzone->blocklist.prev = region;
+            mainzone->size += region->size;
+            last = region;
+        }
+    }
+#endif
 }
 
 
@@ -409,7 +448,11 @@ void Z_CheckHeap (void)
 	    break;
 	}
 	
-	if ( (byte *)block + block->size != (byte *)block->next)
+	if ( (byte *)block + block->size != (byte *)block->next
+#ifdef CARMINAT
+	    && block->user != (void **)mainzone	// CARMINAT: a fence, the end of a region
+#endif
+	    )
 	    I_Error ("Z_CheckHeap: block size does not touch the next block\n");
 
 	if ( block->next->prev != block)
@@ -485,4 +528,23 @@ unsigned int Z_ZoneSize(void)
 {
     return mainzone->size;
 }
+
+#ifdef CARMINAT
+// CARMINAT: the zone split into what stays (static and level), the purgeable cache and free space.
+void Z_Usage(int *fixed, int *cache, int *free)
+{
+    memblock_t *block;
+
+    *fixed = *cache = *free = 0;
+    for (block = mainzone->blocklist.next; block != &mainzone->blocklist; block = block->next)
+    {
+        if (block->tag == PU_FREE)
+            *free += block->size;
+        else if (block->tag >= PU_PURGELEVEL)
+            *cache += block->size;
+        else
+            *fixed += block->size;
+    }
+}
+#endif
 
