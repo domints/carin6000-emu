@@ -172,7 +172,10 @@ The reference disc (2048-byte blocks) still reads 14 bits.
 
 ## 12. Still open on this disc
 
-- POI (table 7): `--area krakow` gives 0 POI, Paris 1: the record layout differs (§6).
+- (Resolved) POI (table 7) and their names (table 11), and the city table (d), are **zlib units**
+  on this disc. The 28-byte POI record and the city record are unchanged once decompressed.
+  Warsaw: about 10 000 POI and about 4 300 places inside the area (the reference disc's extract
+  lists 105 places there; this one lists the smaller settlements too).
 - (Resolved) Table `a` (0x4b6e15 .. 0x4e6181, after table 1) = the kind 4 **house number units**,
   in the directory now (outside it on the reference disc) and **zlib-compressed**. Parcel word
   0x54 points at them as before; decompressed, +12 points back at the parcel. Kraków: ulica

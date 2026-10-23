@@ -268,6 +268,18 @@ def background(f, gp, tables, bbox, sizes, release, progress):
         progress.finish(f"background, level {level} (table {tid:x}): {na} areas, {nr} roads")
 
 
+def unit_image(f, raw):
+    """A unit as stored, or decompressed when it is a zlib unit (+6 == 2: tables 7, 11 and d on the
+    newer discs). Byte +6 is cleared in the result, which is what pbp does after unpacking, so a
+    second call leaves the image alone. The parcel unpacker wants the raw bytes instead, so this
+    is not read_unit()."""
+    if len(raw) >= 8 and raw[6] == 2:
+        d = bytearray(zlib_unit(raw, block_size(f)))
+        d[6] = 0
+        return bytes(d)
+    return raw
+
+
 def poi(f, gp, tables, bbox, progress):
     """Table 7: points of interest."""
     gp.layer("poi", "POINT", [("name", "TEXT"), ("brand", "TEXT"), ("category", "INTEGER"),
@@ -281,7 +293,10 @@ def poi(f, gp, tables, bbox, progress):
         return progress.finish("poi: table empty")
     for k, (b, length) in enumerate(todo):
         progress.step("poi", k, len(todo))
-        u = read_blocks(f, b, length)
+        try:
+            u = unit_image(f, read_blocks(f, b, length))
+        except ValueError:
+            continue
         off, count = struct.unpack_from(">HH", u, 8)
         x0, y0, x1, y1 = struct.unpack_from(">4I", u, 0x10)
         if bbox and (lon(x1) < bbox[0] or lon(x0) > bbox[2] or lat(y1) < bbox[1] or lat(y0) > bbox[3]):
@@ -295,6 +310,12 @@ def poi(f, gp, tables, bbox, progress):
             name, details = None, [None] * 6
             if ptr:
                 t = refs.get(ptr)
+                if len(t) >= 8 and t[6] == 2:       # table 11 is zlib on the newer discs
+                    try:
+                        t = unit_image(f, t)
+                    except ValueError:
+                        t = b""
+                    refs.cache[ptr] = t
                 if noff + 8 <= len(t):
                     # table 11 name entry: name, flags, district, offset of the 40-byte detail record
                     nm, _, district, rec = struct.unpack_from(">HHHH", t, noff)
@@ -323,7 +344,10 @@ def cities(f, gp, tables, bbox, sizes, release, progress):
     found = {}          # (unit block, record offset) -> [name, municipality, lang, alt names, parcel, segment, roots]
     for b, length, head in units(f, data, end):
         progress.step("cities (names)", b - data, end - data)
-        u = read_blocks(f, b, length)
+        try:
+            u = unit_image(f, read_blocks(f, b, length))
+        except ValueError:
+            continue
         off, count = struct.unpack_from(">HH", u, 8)
         count = max(0, min(count, (len(u) - off) // 8))       # defensive: broken slot counts
         for i in range(count):
