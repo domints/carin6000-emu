@@ -17,11 +17,14 @@ import time
 from pathlib import Path
 
 from libs import layers
-from libs.carindb import BLOCK, cstring, header_info, lat, lon, table_directory
+from libs.carindb import (BLOCK, BlockFile, cstring, head_bytes, header_info, lat, lon,
+                          open_database, read_blocks, table_directory)
 from libs.gpkg import GeoPackage
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB = ROOT / "temp/navdb/carindb"
+DEFAULT_DBS = (ROOT / "temp/navdb/DB_0",    # newer disc: DB_0 (+ DB_1, kept under its disc name)
+               ROOT / "temp/navdb/carindb")  # reference NAV_DB CD: a single file
+DEFAULT_DB = next((p for p in DEFAULT_DBS if p.is_file()), DEFAULT_DBS[0])
 
 AREAS = {   # name: (min lon, min lat, max lon, max lat)
     "krakow": (19.6170, 49.9093, 20.2464, 50.1895),
@@ -67,29 +70,32 @@ class Progress:
 def info(f):
     """Header, countries and table directory."""
     sizes, release = header_info(f)
-    f.seek(0)
-    h = f.read(BLOCK)
-    x0, y0, x1, y1 = struct.unpack_from(">4I", h, 0x34)
-    size = f.seek(0, 2)
-    print(f"file      {f.name} ({size / 1e6:.0f} MB, {size // BLOCK} blocks)")
+    tables = table_directory(f)
+    h = head_bytes(f)
+    print(f"file      {f.name} ({f.size / 1e6:.0f} MB, {f.size // f.block} blocks of {f.block})")
     print(f"release   {release}, CD {h[3]}")
+    x0, y0, x1, y1 = struct.unpack_from(">4I", h, 0x34)
     print(f"extent    lon {lon(x0):.3f} .. {lon(x1):.3f}, lat {lat(y0):.3f} .. {lat(y1):.3f}")
-    f.seek(1 * BLOCK)     # table 17: key / value texts
-    report = next((t.decode("latin1") for t in f.read(BLOCK).split(b"\0") if b"name:" in t), "")
+    blk, ln = tables[0x11][1] if 0x11 in tables else (1, 1)     # table 17: key / value texts
+    report = next((t.decode("latin1") for t in read_blocks(f, blk, max(ln, 1)).split(b"\0")
+                   if b"name:" in t), "")
     for line in report.splitlines():     # "1.  name:   eeu_nok_nok_12q4_20130205p."
         key, _, value = line.partition(":")
         key = key.split(".", 1)[-1].strip()
         label = {"name": "data", "content": "content", "conversion date": "converted"}.get(key)
         if label and value.strip():
             print(f"{label:<9} {value.strip().rstrip('.')}")
-    f.seek(4 * BLOCK)     # table b: countries
-    u = f.read(BLOCK)
-    off, count = struct.unpack_from(">HH", u, 8)
-    names = []
-    for i in range(count):
-        name, _, _, rec = struct.unpack_from(">HHHH", u, off + 8 * i)
-        names.append(f"{cstring(u, name)} ({u[rec + 46:rec + 48].decode('latin1')})")
-    print(f"countries {', '.join(names)}")
+    f_blk, f_ln = tables.get(0x0B, ((0, 0), (4, 1), (4, 1)))[1]   # table b: countries
+    u = read_blocks(f, f_blk, max(f_ln, BLOCK // f.block))
+    try:
+        off, count = struct.unpack_from(">HH", u, 8)
+        names = []
+        for i in range(count):
+            name, _, _, rec = struct.unpack_from(">HHHH", u, off + 8 * i)
+            names.append(f"{cstring(u, name)} ({u[rec + 46:rec + 48].decode('latin1')})")
+        print(f"countries {', '.join(names)}")
+    except (struct.error, IndexError):
+        print("countries (not readable on this disc generation)")
     print("tables    id: data blocks")
     for tid, (_, (b, _), (c, n)) in sorted(table_directory(f).items(), key=lambda kv: kv[1][1][0]):
         if b or c:
@@ -107,7 +113,8 @@ def parse_args():
                "\n\nWithout --area / --bbox the whole database is decoded. Only the chosen layers are\n"
                "replaced in an existing output file, the others stay.")
     p.add_argument("carindb", nargs="?", type=Path, default=DEFAULT_DB,
-                   help=f"database file (default: {DEFAULT_DB.relative_to(ROOT)})")
+                   help=f"database: the DB_0 file, or a directory containing it; on the newer discs"
+                        f" a DB_1 next to DB_0 is picked up automatically (default: {DEFAULT_DB})")
     p.add_argument("-o", "--output", type=Path, help="GeoPackage to write (default: temp/navdb/<area>.gpkg)")
     where = p.add_mutually_exclusive_group()
     where.add_argument("-a", "--area", choices=AREAS, help="a named area")
@@ -118,9 +125,7 @@ def parse_args():
     p.add_argument("-q", "--quiet", action="store_true", help="no progress line, only summaries")
     args = p.parse_args()
 
-    if not args.carindb.is_file():
-        p.error(f"{args.carindb} not found; extract it from the map disc image first:\n"
-                f"  python3 navdb/tools/extract_navdb.py")
+    args.carindb = locate_db(p, args.carindb)
     args.box = None
     if args.area:
         args.box = AREAS[args.area]
@@ -139,28 +144,47 @@ def parse_args():
     return args
 
 
+def locate_db(p, path):
+    """The database to open: a DB_0 file, or DB_0 inside the directory given (in the directory
+    itself or, as on a mounted newer disc, in its DB/ subdirectory)."""
+    if path.is_file():
+        return path
+    if path.is_dir():
+        for cand in (path / "DB_0", path / "DB" / "DB_0"):
+            if cand.is_file():
+                return cand
+        p.error(f"no DB_0 in {path}: the newer discs keep the database in DB/DB_0 (+ DB_1),"
+                f" the reference discs in a single carindb file")
+    p.error(f"{path} not found; extract it from the map disc image first:\n"
+            f"  python3 navdb/tools/extract_navdb.py")
+
+
 def main():
     args = parse_args()
-    with open(args.carindb, "rb") as f:
+    try:
+        db = open_database(args.carindb)
+    except ValueError as e:
+        sys.exit(str(e))
+    with db:
         if args.info:
-            info(f)
+            info(db)
             return
-        tables = table_directory(f)
-        sizes, release = header_info(f)
+        tables = table_directory(db)
+        sizes, release = header_info(db)
         where = args.area or (args.bbox if args.box else "whole database")
-        print(f"decoding {args.carindb.name} ({where}): {', '.join(args.layer_list)} -> {args.output}")
+        print(f"decoding {db.name} ({where}): {', '.join(args.layer_list)} -> {args.output}")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         progress = Progress(args.quiet)
         gp = GeoPackage(args.output)
         try:
             if "roads" in args.layer_list:
-                layers.parcels(f, gp, tables, args.box, sizes, release, progress)
+                layers.parcels(db, gp, tables, args.box, sizes, release, progress)
             if "background" in args.layer_list:
-                layers.background(f, gp, tables, args.box, sizes, release, progress)
+                layers.background(db, gp, tables, args.box, sizes, release, progress)
             if "poi" in args.layer_list:
-                layers.poi(f, gp, tables, args.box, progress)
+                layers.poi(db, gp, tables, args.box, progress)
             if "cities" in args.layer_list:
-                layers.cities(f, gp, tables, args.box, sizes, release, progress)
+                layers.cities(db, gp, tables, args.box, sizes, release, progress)
         except KeyboardInterrupt:
             print("\ninterrupted; nothing written", file=sys.stderr)
             sys.exit(130)
