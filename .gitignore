@@ -7,7 +7,7 @@
 # CD image data
 /cd/
 
-__pycache__/
+.DS_Store
 # Custom firmware builds: binaries stay out of git (modules, ELF, disc images, WADs, downloads)
 /cfw/*/build/
 /cfw/**/*.o
