@@ -405,11 +405,12 @@ A gmina has for every street one entry for the whole gmina plus one per settleme
 City POI lists (table d slot 3, 12 B): u32 table 12 unit, u16 offset, u16 count, u16 category,
 u16 offset of the category's brand list (slot 5: 12 B, table 12 unit / offset / count, brand text).
 
-**Country numbers** = the 1-based place in an alphabetical English list of countries, an ISO
-3166 list from before 2006 (all 11 countries of the original fit: bg 33, hr 53, cz 56, ee 67, hu
-97, lv 117, lt 123, pl 171, ro 176, sk 190, si 191). The firmware has no country list (country
-names come from the disc); the encoder gives Serbia 188 (after Senegal, a guess) with Croatia's
-record constants, settings and language byte.
+**Country numbers** index the firmware's **country table** (NAV_SW disc; number − 1 = record,
+6-byte records: u8 index, 5-byte car registration code, the code the menus show): an
+alphabetical English list of 240 countries (1 AFG, 33 BG, 53 HR, 56 CZ, 81 D, 97 H, 171 PL, 176
+RO, 188 WAL, 190 SK, 191 SLO, 237 YU, 240 ZW; gaps have no code). Without a map the menus show
+D (81). The country name comes from the disc. Serbia has no code of its own: the encoder uses
+237 YU, with Croatia's record constants, settings and language byte.
 
 `tests/check_search.py` walks the chain like the device (the original passes 92-99.9 %: names in
 other languages; the encoder output 100 %).

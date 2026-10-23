@@ -4,16 +4,25 @@ Blocks 0-4 come from the original database as templates (header with the record 
 info texts, index directory, country trie, countries) with their pointers and boxes replaced.
 Every table is a list of units in the original order: spatial index part (kind 8 / 9) first,
 then the data units. A unit is built twice: once to learn its size, once more with the final
-unit pointers (sizes do not depend on pointer values).
+unit pointers (sizes do not depend on pointer values). Both passes run in worker processes
+(fork: the workers see the parent's data; a build must not leave results other builds need).
 """
 import struct
 
 from .carindb import BLOCK, table_directory
+from .par import pmap
 
 # table ids in file order after block 4 (the original layout); the house number units (kind 4,
 # outside the directory) follow table 1
 FILE_ORDER = (0x0E, 0x0D, 0x10, 0x0F, 0x12, 0x11, 0x07, 0x01, "hn", 0x1E, 0x03, 0x02, 0x06, 0x16,
               0x15, 0x1C, 0x14, 0x1D, 0x00, 0x18)
+
+
+def build_all(units, resolve, size_only=False):
+    """The units' bytes (or sizes), in order, built in worker processes when there are many."""
+    if size_only:
+        return pmap(lambda u: len(u.build(resolve)), units, 64)
+    return pmap(lambda u: u.build(resolve), units, 64)
 
 
 class Unit:
@@ -23,6 +32,10 @@ class Unit:
     def __init__(self, key, build):
         self.key, self.build = key, build
         self.blocks = None
+
+
+def _zero(key):
+    return 0
 
 
 class Table:
@@ -51,11 +64,10 @@ class Database:
     def layout(self):
         """Blocks for every unit: sizes from a first build with zero pointers."""
         for t in self.tables.values():
-            for u in t.units:
-                data = u.build(lambda k: 0)
-                u.blocks = len(data) // BLOCK
-                if not 1 <= u.blocks <= 8 or len(data) % BLOCK:
-                    raise ValueError(f"unit {u.key}: {len(data)} bytes")
+            for u, size in zip(t.units, build_all(t.units, _zero, size_only=True)):
+                u.blocks = size // BLOCK
+                if not 1 <= u.blocks <= 8 or size % BLOCK:
+                    raise ValueError(f"unit {u.key}: {size} bytes")
         block = 5
         self.where = {}
         for tid in FILE_ORDER:
@@ -144,8 +156,7 @@ class Database:
                 if t.index is not None:
                     for data in t.index.units(self.where[tid][0], self.resolve):
                         f.write(data)
-                for u in t.units:
-                    data = u.build(self.resolve)
+                for u, data in zip(t.units, build_all(t.units, self.resolve)):
                     if len(data) != u.blocks * BLOCK:
                         raise ValueError(f"unit {u.key} changed size")
                     f.write(data)

@@ -141,6 +141,18 @@ def check_parcel(d, ptr, level, sizes, get, res):
     if level == 0 and d[0x70]:
         hn = read_unit_raw(struct.unpack_from(">I", d, 0x54)[0])
         res["house number unit -> its parcel"][struct.unpack_from(">I", hn, 12)[0] == ptr and w(hn, 10) == c4] += 1
+    # prohibited turns (slot 10): the target segment leaves the source's via node
+    if level == 0 and sl[10][1]:
+        s10, c10 = sl[10]
+        ok = True
+        for i, r in enumerate(segs):
+            end = w(d, s4 + rs * (i + 1) + 18)
+            for e in range(w(d, r + 18), end, 8):
+                pp, tgt, bit = struct.unpack_from(">IHH", d, e)
+                via = w(d, r + (2 if bit & 1 else 0))
+                ok &= pp == ptr and tgt in segs and via in (w(d, tgt), w(d, tgt + 2))
+        ok &= w(d, s4 + rs * c4 + 18) == s10 + 8 * c10
+        res["prohibited turn -> segment at the via node"][ok] += 1
     # shape points: ranges increase
     if level == 0:
         starts = [w(d, r + 4) for r in segs] + [w(d, s4 + rs * c4 + 4)]
@@ -177,6 +189,7 @@ def main():
                                   "class index (slot 3)", "segment ends are nodes", "node used by a segment",
                                   "node ring = degree", "node type by degree", "edge point reciprocal",
                                   "slot 9 = edge point neighbours", "shape ranges increase",
+                                  "prohibited turn -> segment at the via node",
                                   "spatial index -> covering unit", "background layout round trip",
                                   "background groups and end records")}
     for tid, level in LEVELS:

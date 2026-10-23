@@ -274,11 +274,17 @@ void carminat_log_memory(const char *when)
 	const unsigned char *p = carminat_env->heap_end;
 	while (p < carminat_env->stack_top && *p == STACK_FILL)
 		p++;
-	printf("memory %s: zone fixed %dK cache %dK free %dK, heap %uK of %uK, stack %uK of %uK\n", when,
+	extern unsigned carminat_lump_reads, carminat_lump_bytes;
+	static unsigned reads, bytes;
+	printf("memory %s: zone fixed %dK cache %dK free %dK, heap %uK of %uK, stack %uK of %uK, "
+	       "CD reads %u (%uK) since the last line\n", when,
 	       fixed >> 10, cache >> 10, free >> 10, carminat_heap_used() >> 10,
 	       (unsigned)(carminat_env->heap_end - carminat_env->heap) >> 10,
 	       (unsigned)(carminat_env->stack_top - p) >> 10,
-	       (unsigned)(carminat_env->stack_top - carminat_env->heap_end) >> 10);
+	       (unsigned)(carminat_env->stack_top - carminat_env->heap_end) >> 10,
+	       carminat_lump_reads - reads, (carminat_lump_bytes - bytes) >> 10);
+	reads = carminat_lump_reads;
+	bytes = carminat_lump_bytes;
 }
 
 /* d_main.c D_DoomLoop, just before the game clock starts (CARMINAT patch): the level is loaded;

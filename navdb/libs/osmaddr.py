@@ -8,38 +8,39 @@ import re
 import sqlite3
 import struct
 
-from .osmnet import fold, gps, hstore
-from .osmplaces import _polygons, street_name
+from .osmnet import fold, gps
+from .osmplaces import street_name
 
 MAX_DIST = 120 / 1.8e-7 / 111320     # metres -> GPS units (latitude scale)
 CELL = 1 << 13
 
 
+NUMBER = re.compile(r'"addr:housenumber"=>"(\d+)')
+STREET = re.compile(r'"addr:street"=>"((?:[^"\\]|\\.)*)"')
+
+
 def load(gpkg, bbox, country=None):
-    """[(point, street name as the encoder writes it, number)]"""
+    """[(point, street name as the encoder writes it, number)]; buildings at the middle of their
+    box (from the GeoPackage's R-tree, no geometry is parsed)."""
     from .osmsrc import rows
     out = []
+    names = {}
     for layer in ("points", "multipolygons"):
         key = "'p' || l.osm_id" if layer == "points" else "coalesce('r' || l.osm_id, 'w' || l.osm_way_id)"
-        for _, other, geom in rows(gpkg,
-                f"SELECT {key}, l.other_tags, l.geom FROM {layer} l JOIN rtree_{layer}_geom r ON l.fid = r.id "
+        for _, other, x, y in rows(gpkg,
+                f"SELECT {key}, l.other_tags, (r.minx + r.maxx) / 2, (r.miny + r.maxy) / 2 FROM {layer} l "
+                f"JOIN rtree_{layer}_geom r ON l.fid = r.id "
                 "WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? AND r.miny <= ? "
                 "AND l.other_tags LIKE '%addr:housenumber%'", (bbox[0], bbox[2], bbox[1], bbox[3])):
-            tags = hstore(other)
-            m = re.match(r"\d+", tags.get("addr:housenumber", ""))
-            street = street_name(fold(tags.get("addr:street")), country)
-            if not m or not street or int(m.group()) >= 32767:
+            m = NUMBER.search(other)
+            st = STREET.search(other)
+            if not m or not st or int(m.group(1)) >= 32767:
                 continue
-            if layer == "points":
-                env = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}[(geom[3] >> 1) & 7]
-                pt = gps(*struct.unpack_from("<dd", geom, 8 + env + 5))
-            else:
-                rings = _polygons(geom)
-                if not rings:
-                    continue
-                ring = rings[0]
-                pt = (sum(p[0] for p in ring) // len(ring), sum(p[1] for p in ring) // len(ring))
-            out.append((pt, street, int(m.group())))
+            raw = st.group(1)
+            if raw not in names:
+                names[raw] = street_name(fold(raw), country)
+            if names[raw]:
+                out.append((gps(x, y), names[raw], int(m.group(1))))
     return out
 
 
@@ -54,33 +55,48 @@ def _project(pt, a, b):
     return math.hypot(px - cx, py - cy), t, dx * (py - ay) - dy * (px - ax)
 
 
+def _nearest_chunk(grid, pieces, chunk):
+    """(piece index, position along it, side, number) of each address of a chunk (worker)."""
+    out = []
+    for pt, street, number in chunk:
+        best = None
+        for k, i, done, seg_len in grid.get((pt[0] // CELL, pt[1] // CELL), ()):
+            piece = pieces[k]
+            if piece.road.name != street:
+                continue
+            dist, t, side = _project(pt, piece.points[i], piece.points[i + 1])
+            if dist < MAX_DIST and (best is None or dist < best[0]):
+                best = (dist, k, done + t * seg_len, side)
+        if best:
+            out.append((best[1], best[2], best[3], number))
+    return out
+
+
 def assign(parcels, addresses):
     """Sets piece.hn = (left from, left to, right from, right to, scheme) on numbered pieces."""
-    grid = {}
+    from .par import pmap
+    grid, pieces = {}, []
     for pc in parcels:
         for piece in pc.pieces:
             if not piece.road.name:
                 continue
+            k = len(pieces)
+            pieces.append(piece)
             pts = piece.points
             done = 0.0
             for i in range(len(pts) - 1):
                 seg_len = math.hypot((pts[i + 1][0] - pts[i][0]) * 0.62, pts[i + 1][1] - pts[i][1])
                 for cx in range(min(pts[i][0], pts[i + 1][0]) // CELL - 1, max(pts[i][0], pts[i + 1][0]) // CELL + 2):
                     for cy in range(min(pts[i][1], pts[i + 1][1]) // CELL - 1, max(pts[i][1], pts[i + 1][1]) // CELL + 2):
-                        grid.setdefault((cx, cy), []).append((piece, i, done, seg_len))
+                        grid.setdefault((cx, cy), []).append((k, i, done, seg_len))
                 done += seg_len
+    step = 20000
+    chunks = [addresses[i:i + step] for i in range(0, len(addresses), step)]
     found = {}
-    for pt, street, number in addresses:
-        best = None
-        for piece, i, done, seg_len in grid.get((pt[0] // CELL, pt[1] // CELL), ()):
-            if piece.road.name != street:
-                continue
-            dist, t, side = _project(pt, piece.points[i], piece.points[i + 1])
-            if dist < MAX_DIST and (best is None or dist < best[0]):
-                best = (dist, piece, done + t * seg_len, side)
-        if best:
-            _, piece, pos, side = best
-            found.setdefault(id(piece), (piece, [], []))[1 if side > 0 else 2].append((pos, number))
+    for part in pmap(lambda chunk: _nearest_chunk(grid, pieces, chunk), chunks, 2):
+        for k, pos, side, number in part:
+            piece = pieces[k]
+            found.setdefault(k, (piece, [], []))[1 if side > 0 else 2].append((pos, number))
     n = 0
     for piece, left, right in found.values():
         def ends(side):

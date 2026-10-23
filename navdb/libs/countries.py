@@ -1,11 +1,11 @@
 """Countries and regions the encoder knows. A map holds one country.
 
-The country number (table b +40, block 2's per-country settings) is the country's 1-based place
-in an alphabetical English country list: the 11 countries of the original disc fit an ISO 3166
-list from before 2006 (bg 33, hr 53, cz 56, ee 67, hu 97, lv 117, lt 123, pl 171, ro 176, sk 190,
-si 191). Serbia is not on the original disc; 188 is its place in that order (after Senegal) and
-is a guess. The firmware has no country table of its own (names come from the disc), so the
-number should only key the per-country settings, copied from a similar country (template).
+The country number (table b +40, block 2's per-country settings) indexes the firmware's country
+table (number - 1 = record index; 6-byte records: index byte, car registration code shown in
+the menus): an alphabetical English list of 240 countries (bg 33 BG, hr 53 HR, pl 171 PL, sk 190
+SK, 188 WAL = Sierra Leone ...). Serbia has no code of its own there: 237 YU (Yugoslavia). The
+country name comes from the disc; the per-country settings are copied from a similar country
+(template).
 
 levels = OSM admin_level of (city, municipality, settlement, district); city: the first level
 found at a point. Poland: gmina, powiat, sołectwo / town, city district (docs/format.md section
@@ -29,7 +29,7 @@ class Country:
 
 COUNTRIES = {
     "pl": Country("polska", "pl", 171, 0x12, "pl", ((7,), 6, 8, 9), ("gmina ",), True),
-    "rs": Country("srbija", "rs", 188, 0x1A, "hr", ((7, 8), 6, 9, 8),
+    "rs": Country("srbija", "rs", 237, 0x1A, "hr", ((7, 8), 6, 9, 8),
                   ("gradska opstina ", "opstina ", "grad ")),
 }
 

@@ -32,12 +32,22 @@ Do wypalenia jak PoC: `cd cd && cdrdao write --device /dev/sr0 carminat_doom.cue
    - `DG_ScreenBuffer` to sam bufor ekranu (384×240), więc ramka 320×200 trafia na ekran jednym kopiowaniem;
    - kolory: tabela PLAYPAL → RGB332 jest wkładana do `COLORMAP` przy każdej zmianie palety (błyski działają), a rysowanie łatek (pasek, menu, HUD), automapa i ramka idą przez tę samą tabelę.
 6. **WAD** (`tools/wadstrip.py`): zostaje jedna mapa (`MAP=E1M1`). Do tego tekstury z jej sidedefów (TEXTURE1 i TEXTURE2 połączone, PNAMES przebudowane), jej flaty i sprite'y wszystkiego, co może się na niej pojawić: lista liczona z tablic stanów silnika (`info.c`, `d_items.c`), z pociskami, upuszczanymi przedmiotami i broniami gracza. Do tego grafika paska, menu i przerywnika. Bez dźwięku, muzyki i dem.
+   Domyślnie (`--lite`; `--full` wyłącza) grafika gry jest cięta tak, żeby cała zmieściła się w RAM-ie urządzenia bez Extension RAM i żeby w trakcie gry nic nie było czytane z CD (każdy odczyt to seek, a pierwsza wersja na sprzęcie tak właśnie zwalniała do kilku sekund na klatkę):
+   - **tekstury ścian:** zostają najczęściej używane, które mieszczą się w budżecie 64 KB (`--tex-budget`); każda inna staje się zachowaną teksturą tej samej wysokości o najbliższym średnim kolorze;
+   - **płaskie tekstury:** zostaje 6 najczęściej używanych (`--flats`), bez animacji. Zachowana klatka animacji dostaje nową nazwę (np. CFLAT), bo silnik wymaga wtedy także ostatniej klatki;
+   - **niebo:** pionowy gradient szerokości 8 pikseli, zbudowany ze średnich kolorów wierszy oryginalnego nieba;
+   - **rzeczy na mapie:** zombie i impy (pozostałe potwory zamienione na nie), shotgun, amunicja, apteczki i klucze. Bez dekoracji, beczek, pancerzy, bonusów i ciężkiej broni;
+   - **sprite'y:** tylko widok z przodu zamiast 8 obrotów i tylko klatki używane przez stany. Bez śmierci z rozerwaniem (łatka w `P_KillMobj`) i bez sprite'a gracza.
+
+   Wynik dla E1M1: ok. 219 KB grafiki zamiast ok. 2 MB. Linia `memory` w logu pokazuje także liczbę odczytów z CD od poprzedniej linii; w trakcie gry powinno być 0.
 
 Łatki w silniku (`third_party/doomgeneric`) są oznaczone `CARMINAT`:
 - strefa z bloków od programu ładującego (`Z_Init` łączy je w jedną listę; między regionami stoi zajęty blok-płot, żeby zwalnianie nie sklejało bloków, które się nie stykają);
 - bufor ekranu 320×200 w bss zamiast w strefie (strefa z małych bloków może nie mieć 64 KB w jednym kawałku);
 - kolory w `R_InitColormaps`, `I_SetPalette`, `V_DrawPatch*`, automapie i `R_FillBackScreen`;
 - brakujące tekstury przełączników są pomijane;
+- bez śmierci z rozerwaniem (WAD lite nie ma tych klatek);
+- licznik odczytów lumpów z płyty (`W_ReadLump`);
 - `.csf` liczy się jako WAD;
 - bez muzyki;
 - bez efektu przejścia (melt);

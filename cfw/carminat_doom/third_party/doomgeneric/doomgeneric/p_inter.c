@@ -714,8 +714,13 @@ P_KillMobj
 	
     }
 
+#ifdef CARMINAT
+    // CARMINAT: no gib deaths, the stripped WAD has no frames for them (tools/wadstrip.py --lite).
+    if (0)
+#else
     if (target->health < -target->info->spawnhealth 
 	&& target->info->xdeathstate)
+#endif
     {
 	P_SetMobjState (target, target->info->xdeathstate);
     }

@@ -344,6 +344,12 @@ int W_LumpLength (unsigned int lump)
 // Loads the lump into the given buffer,
 //  which must be >= W_LumpLength().
 //
+#ifdef CARMINAT
+// CARMINAT: lumps read from the disc, to see whether the game reads during play (each one is a
+// CD seek on the hardware).
+unsigned carminat_lump_reads, carminat_lump_bytes;
+#endif
+
 void W_ReadLump(unsigned int lump, void *dest)
 {
     int c;
@@ -359,6 +365,10 @@ void W_ReadLump(unsigned int lump, void *dest)
     I_BeginRead ();
 	
     c = W_Read(l->wad_file, l->position, dest, l->size);
+#ifdef CARMINAT
+    carminat_lump_reads++;
+    carminat_lump_bytes += l->size;
+#endif
 
     if (c < l->size)
     {

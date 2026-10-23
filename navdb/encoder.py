@@ -27,7 +27,7 @@ import socket
 import sqlite3
 import struct
 
-from libs import (countries, dbwrite, levels, osmaddr, osmbg, osmnet, osmplaces, osmpoi, osmsrc, pack, parcelbuild,
+from libs import (countries, dbwrite, levels, osmaddr, osmbg, osmnet, osmplaces, osmpoi, osmsrc, osmturns, pack, parcelbuild,
                   parcelfmt, search, spindex)
 from libs.carindb import TEXT_TABLES, header_info
 from libs.osmnet import gps
@@ -68,7 +68,6 @@ class Context:
 
 
 CONVERTED = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
-bkeys_of = {}
 
 
 def conversion_stamp():
@@ -202,6 +201,8 @@ def main():
     by_level = {0: parcelbuild.clip(net.edges, leaves)}
     addresses = osmaddr.load(osm, bbox, country)
     numbered = osmaddr.assign(by_level[0], addresses)
+    rules = osmturns.restrictions(args.temp / "osm" / f"{extract}-latest.osm.pbf")
+    n_turns = osmturns.assign(by_level[0], parcelbuild.sorted_pieces, rules)
     n_addresses = len(addresses)
     del addresses                           # millions of tuples for a country
 
@@ -223,7 +224,8 @@ def main():
     for k, pcs in by_level.items():
         print(f"level {k}: {len(pcs)} parcels, {sum(len(pc.pieces) for pc in pcs)} segments, "
               f"{sum(len(pc.borders) for pc in pcs) // 2} border crossings"
-              + (f", {n_addresses} addresses on {numbered} segments" if k == 0 else ""))
+              + (f", {n_addresses} addresses on {numbered} segments, {n_turns} of {len(rules)} turn "
+                 f"restrictions" if k == 0 else ""))
 
     # tables
     db = dbwrite.Database(args.template)
@@ -261,6 +263,9 @@ def main():
     # search: cities and streets (positions = middle of their segments)
     for pc in by_level[0]:                  # lays the parcels out (segment offsets for table f)
         parcelbuild.build_level0(pc, ctx)
+    for k in (1, 2, 3):                     # and the upper levels (edge point offsets their
+        for pc in by_level[k]:              # neighbours read; the units are built in workers)
+            levels.build_upper(pc, k, ctx)
     sums = {}
     for pc in by_level[0]:
         for piece in pc.pieces:
@@ -332,13 +337,13 @@ def main():
     for level in range(6):
         tiles = osmbg.tiles(level, gbox, osmbg.level_shapes(shapes, level), parcelbuild.ORIGIN)
         bkeys = [("bg", level, n) for n in range(len(tiles))]
-        units = [dbwrite.Unit(bkeys[n], lambda resolve, n=n, box=box, sh=sh, level=level:
-                              osmbg.unit_bytes(level, box, sh, resolve(bkeys_of[level][n]), force=True))
-                 for n, (box, sh) in enumerate(tiles)]
-        bkeys_of[level] = bkeys
+        units = [dbwrite.Unit(bkeys[n], lambda resolve, data=data, key=bkeys[n]:
+                              osmbg.with_pointer(data, resolve(key)))
+                 for n, (box, data) in enumerate(tiles)]
         db.add(dbwrite.Table(osmbg.TABLE[level], units,
                              spindex.IndexPart(BACKGROUND[osmbg.TABLE[level]], [(*box, bkeys[n]) for n, (box, _) in enumerate(tiles)])))
         print(f"background level {level}: {len(tiles)} units")
+    del shapes
 
     # block 1: database info with this conversion (ISO 8601 UTC time, host)
     db.blocks[1] = lambda resolve: info_block(args, bbox, gbox)

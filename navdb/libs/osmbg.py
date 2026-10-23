@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from . import bgfmt
 from .carindb import BLOCK
 from .levels import simplify
+from .par import pmap
 from .osmnet import fold, hstore
 from .osmplaces import _polygons, _env
 from .osmnet import gps
@@ -39,6 +40,15 @@ class Shape:
     area: float = 0.0    # m2 (areas)
     label: tuple = None
     levels: tuple = (0, 5)   # first and last level the shape is drawn on
+    bbox: tuple = None       # (x0, y0, x1, y1), set by _box()
+
+
+def _box(s):
+    if s.bbox is None:
+        xs = [p[0] for p in s.points]
+        ys = [p[1] for p in s.points]
+        s.bbox = (min(xs), min(ys), max(xs), max(ys))
+    return s.bbox
 
 
 def _metres_area(ring):
@@ -286,20 +296,20 @@ def clip_to_area(shapes, box):
 
 
 def level_shapes(shapes, level):
-    """Shapes kept on a level, simplified."""
+    """Shapes kept on a level (simplified later, per unit cell: tiles())."""
+    return [s for s in shapes if s.levels[0] <= level <= s.levels[1] and
+            (s.area >= MIN_AREA[level] if s.kind < 100 else s.kind in LINES[level])]
+
+
+def _simplified(shapes, level):
     out = []
     for s in shapes:
-        if not s.levels[0] <= level <= s.levels[1]:
-            continue
         if s.kind < 100:
-            if s.area < MIN_AREA[level]:
-                continue
             pts = simplify(s.points + [s.points[0]], TOLERANCE[level])[:-1]
             if len(pts) >= 3:
                 out.append(Shape(s.kind, s.name, pts, s.area, s.label, s.levels))
-        elif s.kind in LINES[level]:
-            pts = simplify(s.points, TOLERANCE[level])
-            out.append(Shape(s.kind, s.name, pts, levels=s.levels))
+        else:
+            out.append(Shape(s.kind, s.name, simplify(s.points, TOLERANCE[level]), levels=s.levels))
     return out
 
 
@@ -389,55 +399,68 @@ def _grid(pts, x0, y0, step):
 
 
 def tiles(level, area_box, shapes, origin):
-    """[(box, shapes)] of a level: fixed unit size, split while a unit gets too big, then the
-    smallest areas are dropped."""
+    """[(box, unit bytes with pointer 0)] of a level: fixed unit size, split while a unit gets
+    too big, then the smallest areas are dropped."""
     size = UNIT[level]
     ox, oy = origin
-    x = ox + (area_box[0] - ox) // size * size
-    out = []
-    while x < area_box[2]:
-        y = oy + (area_box[1] - oy) // size * size
-        while y < area_box[3]:
-            out += _fit(level, (x, y, x + size, y + size), shapes)
-            y += size
-        x += size
+    cells = {}                  # unit cell -> shapes whose box reaches into it
+    for s in shapes:
+        b = _box(s)
+        for cx in range((b[0] - ox) // size, (b[2] - ox) // size + 1):
+            for cy in range((b[1] - oy) // size, (b[3] - oy) // size + 1):
+                cells.setdefault((cx, cy), []).append(s)
+    boxes = []
+    for cx, cy in sorted(cells):
+        x, y = ox + cx * size, oy + cy * size
+        if x + size > area_box[0] and x < area_box[2] and y + size > area_box[1] and y < area_box[3]:
+            boxes.append(((x, y, x + size, y + size), cells[(cx, cy)]))
+    out = [t for part in pmap(lambda job: _fit(level, job[0], _simplified(job[1], level)), boxes, 4)
+           for t in part]
     if not out:          # every level gets a unit, so no background table is empty
         x = ox + (area_box[0] - ox) // size * size
         y = oy + (area_box[1] - oy) // size * size
-        out = [((x, y, x + size, y + size), [])]
+        box = (x, y, x + size, y + size)
+        out = [(box, unit_bytes(level, box, [], 0, force=True))]
     return out
 
 
+def with_pointer(data, own):
+    """A unit from tiles() with its own unit pointer."""
+    return struct.pack(">I", own) + data[4:]
+
+
 def _size(level, box, shapes):
-    """Used bytes of the unit, or a large number when the offsets overflow."""
+    """(used bytes, unit bytes) of the unit; a large number when the offsets overflow."""
     try:
         data = unit_bytes(level, box, shapes, 0)
     except (struct.error, ValueError):
-        return 1 << 30
-    return 0 if data is None else len(data.rstrip(b"\0"))
+        return 1 << 30, None
+    return (0, None) if data is None else (len(data.rstrip(b"\0")), data)
 
 
 def _fit(level, box, shapes):
-    inside = [s for s in shapes if _overlaps(s.points, box)]
+    inside = [s for s in shapes if _overlaps(s, box)]
     if not inside:
         return []
-    used = _size(level, box, inside)
+    used, data = _size(level, box, inside)
     if used == 0:
         return []
     if used <= MAX_UNIT:
-        return [(box, inside)]
+        return [(box, data)]
     size = box[2] - box[0]
     if size // 2 >= MIN_UNIT[level]:
         h = size // 2
         return [t for dx in (0, h) for dy in (0, h)
                 for t in _fit(level, (box[0] + dx, box[1] + dy, box[0] + dx + h, box[1] + dy + h), inside)]
     keep = sorted(inside, key=lambda s: -_weight(s))
-    while keep and _size(level, box, keep) > MAX_UNIT:
+    while keep:
+        used, data = _size(level, box, keep)
+        if used <= MAX_UNIT:
+            return [(box, data)]
         keep = keep[:int(len(keep) * 0.9)]
-    return [(box, keep)] if keep else []
+    return []
 
 
-def _overlaps(pts, box):
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    return min(xs) < box[2] and max(xs) > box[0] and min(ys) < box[3] and max(ys) > box[1]
+def _overlaps(s, box):
+    b = _box(s)
+    return b[0] < box[2] and b[2] > box[0] and b[1] < box[3] and b[3] > box[1]

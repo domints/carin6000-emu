@@ -122,6 +122,7 @@ class Parcel:
     times: tuple = (0, 0, 0)                         # header 0x60/0x64/0x68
     offsets: dict = field(default_factory=dict)      # point -> offset of its record (after layout)
     seg_base: int = 0                                # offset of slot 4 (after layout)
+    turns: dict = None                               # prohibited turns (osmturns.assign)
 
 
 def _nudge(p, box):
@@ -361,8 +362,10 @@ def build_level0(parcel, ctx):
     o9 = a4(o7 + 6 * n_shape)
     neighbours = sorted({id(n): n for n in parcel.borders.values()}.values(), key=lambda n: (n.box.x, n.box.y))
     o8 = a4(o9 + 8 * len(neighbours))
-    o10 = o11 = o12 = o8
-    otext = o8
+    turns = parcel.turns or {}
+    n10 = sum(len(v) for v in turns.values())
+    o10 = o8
+    o11 = o12 = otext = o10 + 8 * n10
     text = strings.layout(otext)
 
     node_off = {pt: o5 + 8 * k for k, pt in enumerate(inner)}
@@ -398,8 +401,9 @@ def build_level0(parcel, ctx):
             continue
         for k, (i, end) in enumerate(inc):
             ring[(i, end)] = seg_off[inc[(k + 1) % len(inc)][0]]
-    r4, r7 = b"", b""
+    r4, r7, r10 = b"", b"", b""
     shape_pos = o7
+    turn_pos = o10
     for i, pc in enumerate(pieces):
         rd = pc.road
         speed, b6, b7, b17, w28 = segment_defaults(rd)
@@ -411,12 +415,15 @@ def build_level0(parcel, ctx):
                           (rd.paved << 7) | speed, (b6 << 6) | (rd.oneway << 4) | rd.fow,
                           min(pc.length, 0xFFFF), heading(pts[0], pts[1]), heading(pts[-1], pts[-2]),
                           (b7 << 7) | (rd.kind << 4) | rd.cls, b17,
-                          o10, o12, 0, 0,
+                          turn_pos, o12, 0, 0,
                           street_rec[(rd.name, ctx.district_of(rd)) + tuple(ctx.city_of(rd))], w28, o11)
         for q in pts[1:-1]:
             r7 += struct.pack(">HHBB", (q[0] - box.x) // POINT_STEP, (q[1] - box.y) // POINT_STEP, 0, 0)
             shape_pos += 6
-    r4 += struct.pack(">HHH", 0, 0, shape_pos) + bytes(12) + struct.pack(">HHHH", o10, o12, 0, 0) + \
+        for j, bit in sorted(turns.get(i, ())):     # prohibited turns from this segment
+            r10 += struct.pack(">IHH", ctx.ptr(parcel), seg_off[j], bit)
+            turn_pos += 8
+    r4 += struct.pack(">HHH", 0, 0, shape_pos) + bytes(12) + struct.pack(">HHHH", turn_pos, o12, 0, 0) + \
         bytes(4) + struct.pack(">H", o11)
 
     first_seg = {}
@@ -448,9 +455,9 @@ def build_level0(parcel, ctx):
     struct.pack_into(">IIIIIIII", header, 0x54, hn, ctx.ptr(parcel.parent) if parcel.parent else 0, 0,
                      *parcel.times, 10, (1 if hn else 0) << 24 | 1 << 16)
     regions = {0: pad(r0), 1: pad(r1), 2: pad(r2), 3: r3, 4: r4, 5: r5, 6: r6, 7: pad(r7), 9: r9,
-               8: b"", 10: b"", 11: b"", 12: b"", 13: None}
+               8: b"", 10: r10, 11: b"", 12: b"", 13: None}
     counts = {0: n0, 1: n1, 2: n2, 3: 7, 4: len(pieces), 5: len(inner), 6: len(edge_pts),
-              7: n_shape, 8: 0, 9: len(neighbours), 10: 0, 11: 0, 12: 0, 13: 0,
+              7: n_shape, 8: 0, 9: len(neighbours), 10: n10, 11: 0, 12: 0, 13: 0,
               14: len(strings.order)}
     return parcelfmt.RawParcel(header, counts, regions, text)
 

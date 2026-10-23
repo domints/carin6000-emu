@@ -18,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "cfw/poc/tools"))
 import cdsector  # noqa: E402  (EDC / ECC of Mode 2 Form 1 sectors)
+sys.path.insert(0, str(ROOT / "navdb"))
+from libs.par import pmap  # noqa: E402
 
 SECTOR, USER = 2352, 2048
 DATA_LBA = 395                  # carindb on the original disc
@@ -120,8 +122,11 @@ def build(carindb, output, template, chd=False, log=print):
     with open(output, "wb") as out:
         for lba, data in enumerate(head):
             out.write(raw_sector(lba, bytes(data)))
-        for k in range(total - DATA_LBA):
-            out.write(raw_sector(DATA_LBA + k, db[k * USER:(k + 1) * USER]))
+        n, run = total - DATA_LBA, 1024             # EDC / ECC in worker processes, runs of sectors
+        sectors = lambda k0: b"".join(raw_sector(DATA_LBA + k, db[k * USER:(k + 1) * USER])
+                                      for k in range(k0, min(k0 + run, n)))
+        for data in pmap(sectors, range(0, n, run), 4):
+            out.write(data)
     cue = output.with_suffix(".cue")
     cue.write_text(f'FILE "{output.name}" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n')
     log(f"disc: {output} ({total} sectors, {total * SECTOR / 1e6:.0f} MB) and {cue.name}")

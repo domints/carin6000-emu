@@ -56,7 +56,20 @@ CYRILLIC = dict(zip("абвгдђежзијклљмнњопрстћуфхцчџ�
 LATIN = {"đ": "dj", "Đ": "Dj", "ł": "l", "Ł": "L"}
 
 
+_FOLDED = {}
+
+
 def fold(text):
+    """fold() with a cache: names repeat a lot (streets, places)."""
+    if text in _FOLDED:
+        return _FOLDED[text]
+    v = _fold(text)
+    if len(_FOLDED) < 2_000_000:
+        _FOLDED[text] = v
+    return v
+
+
+def _fold(text):
     """Names as the original stores them: lower case ASCII ("Złota" -> "zlota", "Кнеза Милоша"
     -> "kneza milosa")."""
     if not text:
