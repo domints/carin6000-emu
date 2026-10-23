@@ -154,22 +154,21 @@ All road coordinates are valid WGS84 within Poland; none fall in the Czech Repub
   tables (table 1: 105 of 103 572 units, 2 ms instead of a scan). `decoder.py --area / --bbox`
   decodes only those units, like the device loads pieces of the disc while driving.
 
-## 11. pbp parcels: unknown bits before the text area
+## 11. Edge points: the back-offset is 16 bits
 
-pbp-compressed parcels (+6 == 1; all sampled in Kraków, about half in Berlin, none in Paris, which
-is zlib) decode as on
-the reference disc up to slot 7 (segments, nodes, edge points and shape points are consistent),
-but between slot 7 (and slot 11) and the text area's `first, last` pair there is a **variable run
-of extra bits** (≈ 150..700 in samples; not proportional to any slot count, not decoded yet).
-Reading the pair straight after slot 7 gives `first` ≈ 480, so the text was written over slot 2
-and the first segments (street names lost, "aaaa…" names, some parcels crashing).
+pbp parcels (+6 == 1; Kraków, most of Warsaw, about half of Berlin; Paris is zlib and skips this)
+match the reference unpacker except for one field. Slot 6 (edge points, `FUN_00003be4`) ends with
+the byte offset of the same point in the neighbour parcel. The reference pbp reads **14 bits**,
+enough for a unit of at most 8 × 2048 bytes. On this disc the field is **16 bits** (units run well
+past 16 KB). Reading 14 bits leaves the bit stream 2 bits early per edge point, so every later
+edge point, the shape points and the text area land on the wrong bits: roads that cross a parcel
+border spike across the map, and the street names come out empty or garbage.
 
-`unpack.text_start()` finds the pair by value: `first` = the end of the slot 14 name table
-(slot 14 offset + 4 × count, where the names start), `last` inside the buffer. Checked: the pair is
-found in 115 of 117 sampled parcels and all 11 948 place names referenced by slots 0-2 then land on
-string starts and are clean text. The mode 0x15 second passes after the text read from the
-synchronised position again. Open: what the extra bits are (probably new per-segment or per-node
-data of the newer generation; the pbp of this disc's firmware, BSW release 10/11, is not at hand).
+`points16` reads 16 bits when the block size is not 2048. Checked on parcels from 1 KB to 48 KB
+unpacked: every edge point sits on the parcel border, its neighbour pointer is one of the slot 9
+neighbours, and the back-offset is reciprocal (same coordinates in the neighbour). Shape points
+then all lie inside the box, and the text area follows slot 7 directly, as on the reference disc.
+The reference disc (2048-byte blocks) still reads 14 bits.
 
 ## 12. Still open on this disc
 

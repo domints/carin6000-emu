@@ -145,7 +145,7 @@ class Unpacker:
         self.points6(t + 0x1C)
         if self.w(t + 0x2E):
             self.slot11(t + 0x2C)
-        self.texts(parcel=True)
+        self.texts()
         if self.release > 0x14:
             self.w5d = bits_for(self.w(t + 0x36) + 1)
             self.slot0(t, 0x15)
@@ -379,7 +379,9 @@ class Unpacker:
             self._xy(r, prev, r == off)
             self.put_w(r + 4, self.w(8 + 0x10) + self.size[0x08] * b.read(self.w53))
             struct.pack_into(">I", self.dst, r + p, b.read(32))
-            self.put_w(r + p + 4, b.read(14))
+            # back-offset of this point in the neighbour parcel. 14 bits on the reference discs
+            # (a unit is at most 8 x 2048 B); 16 bits on the newer ones, whose units are larger
+            self.put_w(r + p + 4, b.read(14 if self.block == BLOCK else 16))
             prev = r
 
     def points6(self, slot):
@@ -401,38 +403,13 @@ class Unpacker:
             self.put_w(r + 2, b.read(self.n))
             self.put_w(r + 4, b.read(1))
 
-    def text_start(self, parcel):
-        """Position the bit reader on the text area's (first, last) pair; False = no text.
-
-        On the reference disc the pair follows the last slot directly. Parcels of the newer disc
-        carry a variable number of bits more (not decoded yet; 150..700 in samples) before it:
-        there the pair is found by its value, first = the end of the slot 14 name table (the
-        names follow that table), and last inside the buffer."""
-        b, n = self.bits, self.n
-        p0 = b.pos
-        first, last = b.read(n), b.read(n)
-        b.pos = p0
-        if not parcel or not self.w(8 + 0x3A):         # not a parcel, or no names in it
-            return bool(first or last)
-        want = self.w(8 + 0x38) + 4 * self.w(8 + 0x3A)
-        if first >= want and last < len(self.dst):
-            return True
-        end = (len(self.src) - b.base) * 8 - 2 * n
-        for p in range(p0 + 1, end):
-            b.pos = p
-            if b.read(n) == want and want <= b.read(n) < len(self.dst):
-                b.pos = p
-                return True
-        b.pos = p0
-        return False
-
-    def texts(self, parcel=False):
+    def texts(self):
         """FUN_00004abc: the text area, a byte code tuned for names."""
         b = self.bits
         A, B, C, D = self.text
-        if not self.text_start(parcel):
-            return
         first, last = b.read(self.n), b.read(self.n)
+        if not first and not last:
+            return
         phrases = []
         for _ in range(6):
             n = b.read(5)
