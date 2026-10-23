@@ -1,7 +1,9 @@
 # CARiN nav database — newer disc format notes (Opel Astra H / BMW e46 nav generation)
 
-This document captures everything learned while adapting the `carindb2gpkg.py` decoder to a newer
-NAV_DB map disc (mounted at `/Volumes/NAV_DB_21709`, files `DB/DB_0` + `DB/DB_1`). The reference
+This document captures everything learned while adapting the decoder (`navdb/decoder.py`,
+`navdb/libs/`) to a newer NAV_DB map disc (CD 21709, 2015-08-04, HERE 14Q4 "eur_hw_her_bmw", files
+`DB/DB_0` + `DB/DB_1`; the decoder expects them in `temp/navdb/`, which may be a symlink to the
+disc's `DB` directory). The reference
 decoder was written against the `NAV_DB` disc (ISO9660, MapScape/Continental, CD 21435, 2013-04-08,
 Eastern Europe, db release 34, 2048-byte blocks). The newer disc uses the same overall structure
 but differs in several significant ways.
@@ -131,3 +133,50 @@ With the patched decoder, the Krakow area (bbox 19.8,49.9 → 20.2,50.15) decode
 | overview roads (table 1c) | 909 |
 
 All road coordinates are valid WGS84 within Poland; none fall in the Czech Republic.
+
+(Counts from before §10-11; with the index lookup and the text area fix level 0 gives 105 parcels /
+62 795 segments, 65 % of them named.)
+
+## 10. Index directory and spatial index
+
+- **Table 4** (index directory, kind 7) is no longer block 2 (that is table 17 now) but blocks 3-6
+  (4 × 512 bytes): find it through the table directory. Same 28-byte records from 0x14.
+- The **grid extent** is a square of **3 × 2^29** units (x −249 987 072 .. 1 360 625 664, y
+  −1 132 834 816 .. 477 777 920) instead of 2^29. The record of table 18 (TMC) has a pointer but an
+  all-zero extent: skip it, the list continues after it.
+- Grid sizes N (kind 8 cells): table 1 1024 (cells of 1 572 864 units ≈ 0.28°), 7 256, 1e/6/16 64,
+  3/15 32, 2 16, 1c/14 2, 1d 1. u32 0x0c of every kind 8 unit = extent / N (checked on all 11).
+- Kind 8 units are raw; **kind 9 leaves may be zlib units** (+6 == 2, ~10 % in table 1, most of
+  them in the coarse tables).
+- Position → unit lookup (`spindex.Index`): kind 8 headers only → the kind 8 units holding the top
+  cells under the box → their kind 9 leaves → subcells → data unit pointers. **Checked**: for the
+  Kraków box it returns exactly the units a full table scan finds by box overlap, on all 11
+  tables (table 1: 105 of 103 572 units, 2 ms instead of a scan). `decoder.py --area / --bbox`
+  decodes only those units, like the device loads pieces of the disc while driving.
+
+## 11. pbp parcels: unknown bits before the text area
+
+pbp-compressed parcels (+6 == 1; all sampled in Kraków, about half in Berlin, none in Paris, which
+is zlib) decode as on
+the reference disc up to slot 7 (segments, nodes, edge points and shape points are consistent),
+but between slot 7 (and slot 11) and the text area's `first, last` pair there is a **variable run
+of extra bits** (≈ 150..700 in samples; not proportional to any slot count, not decoded yet).
+Reading the pair straight after slot 7 gives `first` ≈ 480, so the text was written over slot 2
+and the first segments (street names lost, "aaaa…" names, some parcels crashing).
+
+`unpack.text_start()` finds the pair by value: `first` = the end of the slot 14 name table
+(slot 14 offset + 4 × count, where the names start), `last` inside the buffer. Checked: the pair is
+found in 115 of 117 sampled parcels and all 11 948 place names referenced by slots 0-2 then land on
+string starts and are clean text. The mode 0x15 second passes after the text read from the
+synchronised position again. Open: what the extra bits are (probably new per-segment or per-node
+data of the newer generation; the pbp of this disc's firmware, BSW release 10/11, is not at hand).
+
+## 12. Still open on this disc
+
+- POI (table 7): `--area krakow` gives 0 POI, Paris 1: the record layout differs (§6).
+- (Resolved) Table `a` (0x4b6e15 .. 0x4e6181, after table 1) = the kind 4 **house number units**,
+  in the directory now (outside it on the reference disc) and **zlib-compressed**. Parcel word
+  0x54 points at them as before; decompressed, +12 points back at the parcel. Kraków: ulica
+  Floriańska 1-57.
+- `cities` still walks the whole of table d (names have no spatial index; the device finds cities
+  by name through the tries).

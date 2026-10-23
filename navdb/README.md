@@ -27,7 +27,11 @@ python3 navdb/decoder.py --bbox 20.98,52.22,21.04,52.25 -o /tmp/centrum.gpkg
 python3 navdb/decoder.py --help
 ```
 
-Obszary: `warszawa`, `mazowieckie`, `polska`; bez `--area`/`--bbox` dekodowana jest cała baza. Warstwy: `roads`, `background`, `poi`, `cities`. Przy wyborze części warstw pozostałe w istniejącym pliku zostają bez zmian. Wymagany jest tylko Python 3 (bez GDAL i innych bibliotek).
+Nowsza płyta (DVD, `DB/DB_0` + `DB/DB_1`): wystarczy dowiązanie `temp/navdb -> <płyta>/DB`, `DB_1` dołącza się sam; wynik trafia wtedy do `temp/` (katalog płyty jest tylko do odczytu). Różnice formatu: [../docs/newer_disc_format.md](../docs/newer_disc_format.md).
+
+Przy `--area`/`--bbox` dekoder czyta tylko jednostki spod prostokąta, znalezione przez indeks przestrzenny (jak urządzenie podczas jazdy), a nie całe tablice.
+
+Obszary: `krakow`, `warszawa`, `malopolskie`, `mazowieckie`, `polska`; bez `--area`/`--bbox` dekodowana jest cała baza. Warstwy: `roads`, `background`, `poi`, `cities`. Przy wyborze części warstw pozostałe w istniejącym pliku zostają bez zmian. Wymagany jest tylko Python 3 (bez GDAL i innych bibliotek).
 
 ## Co jest w GeoPackage
 

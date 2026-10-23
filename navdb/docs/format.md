@@ -552,9 +552,13 @@ index directory's `a` field and zoom unit. Not needed: tables 0 and 18, slot 12 
 - `decoder.py [carindb] [-o out.gpkg] [--area NAME | --bbox lon0,lat0,lon1,lat1] [--layers …] [--info]`: layers `parcels`,
   `roads`, `areas`, `overview_roads`, `poi` (with address / phone / postcode), `cities`; RTree
   index; QGIS styles in `layer_styles`.
-- `libs/spindex.py`: block 2 index directory and the kind 8 / 9 spatial index (`cells()` yields
-  every subcell with its data unit).
+- `libs/spindex.py`: table 4 index directory and the kind 8 / 9 spatial index (`Index(f, a, b)`:
+  `cells(box)` yields the subcells with their data units, `pointers(box)` the data units under a
+  box, reading only the index units needed). With `--area` / `--bbox` the decoder reads only those
+  units (roads, background, POI), not whole tables.
   Whole database ≈ 20 min, 2.8 GB.
+- Newer discs (DB_0 + DB_1, 512-byte blocks, zlib units, other index extent):
+  `../../docs/newer_disc_format.md`.
 - Ghidra (headless, Java script): `analyzeHeadless temp/navdb/ghidra navdb_db -import
   temp/navdb/mods/*.mod -processor 68000:BE:32:MC68030 -postScript ExportOS9Modules.java
   $PWD/temp/navdb/ghidra_out -scriptPath $PWD/tools/ghidra -overwrite`, then
