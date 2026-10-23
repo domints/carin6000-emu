@@ -11,6 +11,7 @@ Examples:
 The format is described in navdb/docs/format.md.
 """
 import argparse
+import os
 import struct
 import sys
 import time
@@ -23,9 +24,11 @@ from libs.gpkg import GeoPackage
 from libs.unpack import zlib_unit
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DBS = (ROOT / "temp/navdb/DB_0",    # newer disc: DB_0 (+ DB_1, kept under its disc name)
-               ROOT / "temp/navdb/carindb")  # reference NAV_DB CD: a single file
+NAVDB = ROOT / "temp/navdb"                 # may be a symlink to the disc's DB directory (read-only)
+DEFAULT_DBS = (NAVDB / "DB_0",              # newer disc: DB_0 (+ DB_1 next to it)
+               NAVDB / "carindb")           # reference NAV_DB CD: a single file
 DEFAULT_DB = next((p for p in DEFAULT_DBS if p.is_file()), DEFAULT_DBS[0])
+OUT_DIR = NAVDB if os.access(NAVDB, os.W_OK) else ROOT / "temp"
 
 AREAS = {   # name: (min lon, min lat, max lon, max lat)
     "krakow": (19.6170, 49.9093, 20.2464, 50.1895),
@@ -126,9 +129,10 @@ def parse_args():
                "\n\nWithout --area / --bbox the whole database is decoded. Only the chosen layers are\n"
                "replaced in an existing output file, the others stay.")
     p.add_argument("carindb", nargs="?", type=Path, default=DEFAULT_DB,
-                   help=f"database: the DB_0 file, or a directory containing it; on the newer discs"
-                        f" a DB_1 next to DB_0 is picked up automatically (default: {DEFAULT_DB})")
-    p.add_argument("-o", "--output", type=Path, help="GeoPackage to write (default: temp/navdb/<area>.gpkg)")
+                   help=f"database: the DB_0 (or carindb) file, or the directory holding it; a DB_1"
+                        f" next to DB_0 is picked up automatically (default: {DEFAULT_DB})")
+    p.add_argument("-o", "--output", type=Path,
+                   help=f"GeoPackage to write (default: {OUT_DIR.relative_to(ROOT)}/<area>.gpkg)")
     where = p.add_mutually_exclusive_group()
     where.add_argument("-a", "--area", choices=AREAS, help="a named area")
     where.add_argument("-b", "--bbox", metavar="LON0,LAT0,LON1,LAT1", help="a box in degrees")
@@ -153,21 +157,19 @@ def parse_args():
     if unknown:
         p.error(f"unknown layer {', '.join(unknown)}; choose from {', '.join(LAYERS)}")
     if not args.output:
-        args.output = ROOT / "temp/navdb" / f"{args.area or ('bbox' if args.box else 'carindb')}.gpkg"
+        args.output = OUT_DIR / f"{args.area or ('bbox' if args.box else 'carindb')}.gpkg"
     return args
 
 
 def locate_db(p, path):
-    """The database to open: a DB_0 file, or DB_0 inside the directory given (in the directory
-    itself or, as on a mounted newer disc, in its DB/ subdirectory)."""
+    """The database to open: a DB_0 / carindb file, or the directory holding it."""
     if path.is_file():
         return path
     if path.is_dir():
-        for cand in (path / "DB_0", path / "DB" / "DB_0"):
+        for cand in (path / "DB_0", path / "carindb"):
             if cand.is_file():
                 return cand
-        p.error(f"no DB_0 in {path}: the newer discs keep the database in DB/DB_0 (+ DB_1),"
-                f" the reference discs in a single carindb file")
+        p.error(f"no DB_0 or carindb in {path}")
     p.error(f"{path} not found; extract it from the map disc image first:\n"
             f"  python3 navdb/tools/extract_navdb.py")
 
