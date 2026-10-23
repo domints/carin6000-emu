@@ -66,6 +66,14 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
         return
     for b, length, head in units(f, data, end):
         progress.step(f"roads, level {level}", b - data, end - data)
+        # raw and pbp units keep the 116-byte parcel header (never compressed) on disk: the box
+        # allows a cheap bbox pre-filter before unpacking; only zlib units (+6 == 2) need the
+        # unpacked image for it
+        if head[6] != 2:
+            hx1, hy1, hx2, hy2 = struct.unpack_from(">4I", head, 0x44)
+            if bbox and (lon(hx2) < bbox[0] or lon(hx1) > bbox[2]
+                         or lat(hy2) < bbox[1] or lat(hy1) > bbox[3]):
+                continue
         try:
             d = unpacker.unpack(read_blocks(f, b, length))
         except (ValueError, struct.error, IndexError, KeyError):
@@ -108,10 +116,13 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
         hn_unit, = struct.unpack_from(">I", d, 0x54) if level == 0 else (0,)
         if hn_unit:
             hu = read_unit(f, hn_unit)
+            if len(hu) < 0x10:             # defensive: pointer into a gap / outside the database
+                hn_unit = 0
+        hn_n = (len(hu) - 0x10) // 10 if hn_unit else 0    # one 10 B record per segment
         for i in range(seg_n):
             r = seg_off + i * rs
             numbers = [None] * 5
-            if hn_unit:
+            if i < hn_n:
                 lf, rf, lt, rt, scheme = struct.unpack_from(">5H", hu, 0x10 + 10 * i)
                 numbers = [None if v == HN_NONE else v for v in (lf, lt, rf, rt)] + [scheme]
             a, c = w(r), w(r + 2)
@@ -120,8 +131,9 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
             # shape points between the end points (dbq FUN_000149ba): slot 7 records (type 0x0c,
             # x, y, flags) from this segment's +4 up to the next segment's +4
             s7_end = w(8 + 0x1C) + sizes[0x0C] * w(8 + 0x1E)
+            s7_end = min(s7_end, len(d) - sizes[0x0C] + 1)     # defensive: past the buffer end
             nxt = w(r + rs + 4) if i + 1 < seg_n else s7_end
-            shape = range(w(r + 4), min(nxt or s7_end, s7_end), sizes[0x0C]) if w(r + 4) else ()
+            shape = range(w(r + 4), min(nxt, s7_end), sizes[0x0C]) if w(r + 4) else ()
             pts = [(box[0] + w(o) * sx, box[1] + w(o + 2) * sy) for o in (a, *shape, c)]
             street, district, parent = place(w(r + 26)) if rs >= 28 else (None, None, 0)
             city_a, city_b, parent = place(parent)
@@ -132,7 +144,7 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
             turns_end = w(8 + 0x28) + sizes[0x14] * w(8 + 0x2A) if last else w(r + rs + 18)
             attrs_end = w(8 + 0x30) + sizes[0x15] * w(8 + 0x32) if last else w(r + rs + 20)
             ferry = None
-            for o in range(w(r + 20), attrs_end, sizes[0x15]):
+            for o in range(w(r + 20), min(attrs_end, len(d) - sizes[0x15] + 1), sizes[0x15]):
                 if w(o) == 5:
                     ferry = w(o + 2)
             gp.add("roads", pts, (level, b, i, street, district, city_a or city_b, country,
