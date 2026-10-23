@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = ROOT / "temp/navdb/carindb"
 
 AREAS = {   # name: (min lon, min lat, max lon, max lat)
+    "krakow": (19.6170, 49.9093, 20.2464, 50.1895),
     "warszawa": (20.85, 52.10, 21.27, 52.37),
+    "malopolskie": (18.8404, 49.1646, 21.5254, 50.5196),
     "mazowieckie": (19.25, 51.00, 23.15, 53.50),
     "polska": (14.05, 48.95, 24.20, 54.90),
 }
