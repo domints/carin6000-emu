@@ -17,9 +17,10 @@ import time
 from pathlib import Path
 
 from libs import layers
-from libs.carindb import (BLOCK, BlockFile, cstring, head_bytes, header_info, lat, lon,
-                          open_database, read_blocks, table_directory)
+from libs.carindb import (BlockFile, cstring, head_bytes, header_info, lat, lon,
+                          open_database, read_blocks, read_unit, table_directory)
 from libs.gpkg import GeoPackage
+from libs.unpack import zlib_unit
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DBS = (ROOT / "temp/navdb/DB_0",    # newer disc: DB_0 (+ DB_1, kept under its disc name)
@@ -72,30 +73,42 @@ def info(f):
     sizes, release = header_info(f)
     tables = table_directory(f)
     h = head_bytes(f)
-    print(f"file      {f.name} ({f.size / 1e6:.0f} MB, {f.size // f.block} blocks of {f.block})")
+    siz1 = f.f1.seek(0, 2) if getattr(f, "f1", None) else 0
+    f.f1 and f.f1.seek(0)
+    blocks = (f.size + siz1) // f.block
+    print(f"file      {f.name} ({f.size / 1e6:.0f} MB" +
+          (f" + DB_1 {siz1 / 1e6:.0f} MB" if siz1 else "") + f", {blocks} blocks of {f.block})")
     print(f"release   {release}, CD {h[3]}")
     x0, y0, x1, y1 = struct.unpack_from(">4I", h, 0x34)
     print(f"extent    lon {lon(x0):.3f} .. {lon(x1):.3f}, lat {lat(y0):.3f} .. {lat(y1):.3f}")
-    blk, ln = tables[0x11][1] if 0x11 in tables else (1, 1)     # table 17: key / value texts
-    report = next((t.decode("latin1") for t in read_blocks(f, blk, max(ln, 1)).split(b"\0")
-                   if b"name:" in t), "")
+    blk, ln = tables.get(0x11, ((0, 0), (1, 1), (1, 1)))[1]    # table 17: key / value texts
+    t17 = read_unit(f, (blk << 8) | max(ln, 1))
+    if t17[6] == 2:                                            # zlib units on the newer discs
+        t17 = zlib_unit(t17, f.block)
+    report = next((t.decode("latin1") for t in t17.split(b"\0") if b"name:" in t), "")
     for line in report.splitlines():     # "1.  name:   eeu_nok_nok_12q4_20130205p."
         key, _, value = line.partition(":")
         key = key.split(".", 1)[-1].strip()
         label = {"name": "data", "content": "content", "conversion date": "converted"}.get(key)
         if label and value.strip():
             print(f"{label:<9} {value.strip().rstrip('.')}")
-    f_blk, f_ln = tables.get(0x0B, ((0, 0), (4, 1), (4, 1)))[1]   # table b: countries
-    u = read_blocks(f, f_blk, max(f_ln, BLOCK // f.block))
-    try:
-        off, count = struct.unpack_from(">HH", u, 8)
-        names = []
-        for i in range(count):
-            name, _, _, rec = struct.unpack_from(">HHHH", u, off + 8 * i)
-            names.append(f"{cstring(u, name)} ({u[rec + 46:rec + 48].decode('latin1')})")
-        print(f"countries {', '.join(names)}")
-    except (struct.error, IndexError):
-        print("countries (not readable on this disc generation)")
+    tb = tables.get(0x0B)                                       # table b: countries
+    if not tb:
+        print("countries (table b missing from the directory)")
+    else:
+        blk, ln = tb[1]
+        u = read_unit(f, (blk << 8) | max(ln, 1))
+        if u[6] == 2:
+            u = zlib_unit(u, f.block)
+        try:
+            off, count = struct.unpack_from(">HH", u, 8)
+            names = []
+            for i in range(count):
+                name, _, _, rec = struct.unpack_from(">HHHH", u, off + 8 * i)
+                names.append(f"{cstring(u, name)} ({u[rec + 46:rec + 48].decode('latin1')})")
+            print(f"countries {', '.join(names)}")
+        except (struct.error, IndexError):
+            print("countries (not readable on this disc generation)")
     print("tables    id: data blocks")
     for tid, (_, (b, _), (c, n)) in sorted(table_directory(f).items(), key=lambda kv: kv[1][1][0]):
         if b or c:
