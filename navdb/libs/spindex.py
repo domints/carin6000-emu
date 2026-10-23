@@ -16,13 +16,12 @@ in this unit (0 = no data there). Every subcell points to the one data unit cove
 import math
 import struct
 
-from .carindb import BLOCK, read_unit
+from .carindb import BLOCK, block_size, read_blocks, read_unit
 
 
 def directory(f):
     """{index start pointer: (x0, y0, x1, y1, a, zoom_from, zoom_to)} from block 2."""
-    f.seek(2 * BLOCK)
-    d = f.read(BLOCK)
+    d = read_blocks(f, 2, BLOCK // block_size(f))[:BLOCK]
     out = {}
     for o in range(0x14, BLOCK - 28, 28):
         ptr, x0, y0, x1, y1, a, z0, z1, pad = struct.unpack_from(">I4i4H", d, o)
@@ -35,21 +34,27 @@ def directory(f):
     return out
 
 
-def cells(f, first, data):
-    """Yield (x0, y0, size, unit pointer) for every subcell of the index between block first and the
-    data start, using the extent from the block 2 directory."""
-    f.seek(first * BLOCK)
-    ptr0, = struct.unpack_from(">I", f.read(4), 0)
-    ext = directory(f)[ptr0]
+def walk(f, first, data):
+    """(extent, top cells) of the index part between block first and the data start: the extent
+    from the block 2 directory and the kind 9 unit pointers of every grid cell, column-major
+    (cell i = column i // N, row i % N over the extent; N = sqrt of the cell count)."""
+    ptr0, = struct.unpack_from(">I", read_blocks(f, first, 1), 0)
     top, b = [], first
     while b < data:
-        u = read_unit(f, (b << 8) | 8)
-        n = u[3]
+        ptr, = struct.unpack_from(">I", read_blocks(f, b, 1), 0)
+        u = read_unit(f, ptr)
         if struct.unpack_from(">H", u, 4)[0] != 8:
             break
         off, cnt = struct.unpack_from(">HH", u, 8)
         top += struct.unpack_from(f">{cnt}I", u, off)
-        b += n
+        b += ptr & 0xFF          # the unit's own length (8 blocks on the reference discs)
+    return directory(f)[ptr0][:4], top
+
+
+def cells(f, first, data):
+    """Yield (x0, y0, size, unit pointer) for every subcell of the index between block first and the
+    data start, using the extent from the block 2 directory."""
+    ext, top = walk(f, first, data)
     grid = math.isqrt(len(top))
     leaf = (ext[2] - ext[0]) // grid
     for i, p in enumerate(top):
@@ -63,6 +68,37 @@ def cells(f, first, data):
         for k, o in enumerate(struct.unpack_from(f">{cnt}H", u, off)):
             if o:
                 yield lx + (k // sub) * size, ly + (k % sub) * size, size, struct.unpack_from(">I", u, o)[0]
+
+
+def pointers(f, first, data, box):
+    """(block, length) of the distinct data units that a subcell overlapping `box` (x0, y0, x1, y1
+    in GPS units) points at — the position -> unit lookup (format.md §2) the device does instead of
+    walking a whole table. Covering subcells may repeat a unit; each comes out once."""
+    ext, top = walk(f, first, data)
+    grid = math.isqrt(len(top))
+    leaf = (ext[2] - ext[0]) // grid
+    seen, out = set(), []
+    for i, p in enumerate(top):
+        if not p:
+            continue
+        lx, ly = ext[0] + (i // grid) * leaf, ext[1] + (i % grid) * leaf
+        if lx >= box[2] or lx + leaf <= box[0] or ly >= box[3] or ly + leaf <= box[1]:
+            continue                            # whole grid cell outside the box
+        u = read_unit(f, p)
+        off, cnt = struct.unpack_from(">HH", u, 8)
+        sub = math.isqrt(cnt)
+        size = leaf // sub
+        for k, o in enumerate(struct.unpack_from(f">{cnt}H", u, off)):
+            if not o:
+                continue                        # no data (sea, outside the map)
+            sx0, sy0 = lx + (k // sub) * size, ly + (k % sub) * size
+            if sx0 >= box[2] or sx0 + size <= box[0] or sy0 >= box[3] or sy0 + size <= box[1]:
+                continue                        # subcell outside the box
+            ptr, = struct.unpack_from(">I", u, o)
+            if ptr and ptr not in seen:
+                seen.add(ptr)
+                out.append((ptr >> 8, ptr & 0xFF))
+    return out
 
 
 # --- writing (encoder) ---
