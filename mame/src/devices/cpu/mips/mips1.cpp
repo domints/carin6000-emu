@@ -222,7 +222,28 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_cache((icache_size && dcache_size) ? CACHED : UNCACHED)
 	, m_cache_pws(cache_pws)
 	, m_in_brcond(*this, 0)
+	, m_branch_likely(false)
+	, m_no_cache(false)
+	, m_mult_rd(false)
+	, m_user_kseg(false)
+	, m_ll_active(false)
+	, m_exc_log(0)
 {
+}
+
+void mips1core_device_base::take_branch(bool condition, bool likely, bool link, u32 const op)
+{
+	// Link forms write the return address even when a branch-likely is not taken.
+	// MIPS I BLTZAL/BGEZAL write it only when the branch is taken.
+	if (link && (condition || likely))
+		m_r[31] = m_pc + 8;
+	if (condition)
+	{
+		m_branch_state = BRANCH;
+		m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+	}
+	else if (likely)
+		m_pc += 4; // nullify the delay slot; the epilogue advances pc once more
 }
 
 mips1_device_base::mips1_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws)
@@ -374,6 +395,8 @@ void mips1core_device_base::device_reset()
 	m_cop0[COP0_Status] = SR_BEV | SR_TS;
 
 	m_bus_error = false;
+	m_ll_active = false;
+	m_exc_log = 0;
 }
 
 void r3041_device::device_reset()
@@ -450,6 +473,10 @@ void mips1core_device_base::execute_run()
 				case 0x0d: // BREAK
 					generate_exception(EXCEPTION_BREAK);
 					break;
+				case 0x0f: // SYNC (MIPS II)
+					if (!m_branch_likely)
+						generate_exception(EXCEPTION_INVALIDOP);
+					break;
 				case 0x10: // MFHI
 					m_r[RDREG] = m_hi;
 					break;
@@ -468,6 +495,8 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
+						if (m_mult_rd && RDREG)
+							m_r[RDREG] = m_lo;
 						m_icount -= 11;
 					}
 					break;
@@ -477,6 +506,8 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
+						if (m_mult_rd && RDREG)
+							m_r[RDREG] = m_lo;
 						m_icount -= 11;
 					}
 					break;
@@ -561,35 +592,17 @@ void mips1core_device_base::execute_run()
 				 */
 				switch (RTREG & 0x1d)
 				{
-				case 0x00: // BLTZ
-					if (s32(m_r[RSREG]) < 0)
-					{
-						m_branch_state = BRANCH;
-						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-					}
+				case 0x00: // BLTZ, BLTZL
+					take_branch(s32(m_r[RSREG]) < 0, m_branch_likely && BIT(RTREG, 1), false, op);
 					break;
-				case 0x01: // BGEZ
-					if (s32(m_r[RSREG]) >= 0)
-					{
-						m_branch_state = BRANCH;
-						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-					}
+				case 0x01: // BGEZ, BGEZL
+					take_branch(s32(m_r[RSREG]) >= 0, m_branch_likely && BIT(RTREG, 1), false, op);
 					break;
-				case 0x10: // BLTZAL
-					if (s32(m_r[RSREG]) < 0)
-					{
-						m_branch_state = BRANCH;
-						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
-					}
+				case 0x10: // BLTZAL, BLTZALL
+					take_branch(s32(m_r[RSREG]) < 0, m_branch_likely && BIT(RTREG, 1), true, op);
 					break;
-				case 0x11: // BGEZAL
-					if (s32(m_r[RSREG]) >= 0)
-					{
-						m_branch_state = BRANCH;
-						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
-					}
+				case 0x11: // BGEZAL, BGEZALL
+					take_branch(s32(m_r[RSREG]) >= 0, m_branch_likely && BIT(RTREG, 1), true, op);
 					break;
 				default:
 					generate_exception(EXCEPTION_INVALIDOP);
@@ -632,6 +645,21 @@ void mips1core_device_base::execute_run()
 					m_branch_state = BRANCH;
 					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
 				}
+				break;
+			case 0x14: // BEQL
+			case 0x15: // BNEL
+			case 0x16: // BLEZL
+			case 0x17: // BGTZL
+				if (!m_branch_likely)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if ((op >> 26) == 0x14)
+					take_branch(m_r[RSREG] == m_r[RTREG], true, false, op);
+				else if ((op >> 26) == 0x15)
+					take_branch(m_r[RSREG] != m_r[RTREG], true, false, op);
+				else if ((op >> 26) == 0x16)
+					take_branch(s32(m_r[RSREG]) <= 0, true, false, op);
+				else
+					take_branch(s32(m_r[RSREG]) > 0, true, false, op);
 				break;
 			case 0x08: // ADDI
 				{
@@ -716,6 +744,20 @@ void mips1core_device_base::execute_run()
 			case 0x2e: // SWR
 				swr(op);
 				break;
+			case 0x2f: // CACHE (MIPS II). No effect while the cache is not modeled.
+				if (!m_no_cache)
+					generate_exception(EXCEPTION_INVALIDOP);
+				break;
+			case 0x30: // LL
+				if (!m_branch_likely)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else
+					load<u32>(SIMMVAL + m_r[RSREG], [this, op](u32 temp)
+					{
+						m_r[RTREG] = temp;
+						m_ll_active = true;
+					});
+				break;
 			case 0x31: // LWC1
 				handle_cop1(op);
 				break;
@@ -724,6 +766,18 @@ void mips1core_device_base::execute_run()
 				break;
 			case 0x33: // LWC3
 				handle_cop3(op);
+				break;
+			case 0x38: // SC
+				if (!m_branch_likely)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (m_ll_active)
+				{
+					store<u32>(SIMMVAL + m_r[RSREG], m_r[RTREG]);
+					m_r[RTREG] = 1;
+					m_ll_active = false;
+				}
+				else
+					m_r[RTREG] = 0;
 				break;
 			case 0x39: // SWC1
 				handle_cop1(op);
@@ -797,14 +851,14 @@ mips1core_device_base::translate_result mips1core_device_base::translate(int int
 	// check for kernel memory address
 	if (BIT(address, 31))
 	{
-		// check debug or kernel mode
-		if (debug || !(SR & SR_KUc))
+		// check debug or kernel mode. m_user_kseg also allows user-mode kseg0/kseg1.
+		if (debug || !(SR & SR_KUc) || m_user_kseg)
 		{
 			switch (address & 0xe0000000)
 			{
 			case 0x80000000: // kseg0: unmapped, cached, privileged
 				address &= ~0xe0000000;
-				return m_cache;
+				return m_no_cache ? UNCACHED : m_cache;
 
 			case 0xa0000000: // kseg1: unmapped, uncached, privileged
 				address &= ~0xe0000000;
@@ -826,7 +880,7 @@ mips1core_device_base::translate_result mips1core_device_base::translate(int int
 		// kuseg physical addresses have a 1GB offset
 		address += 0x40000000;
 
-	return m_cache;
+	return m_no_cache ? UNCACHED : m_cache;
 }
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
@@ -836,6 +890,16 @@ std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembl
 
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
+	// Bring-up aid for the MIPS II subset: the first exceptions taken outside the boot ROM.
+	if (m_branch_likely && m_pc < 0xbfc00000 && exception != EXCEPTION_SYSCALL && m_exc_log < 16)
+	{
+		m_exc_log++;
+		logerror("exception %02x epc %08x (%s)\n", exception >> 2, m_pc, machine().describe_context());
+	}
+
+	// a load-linked is void once any exception is taken
+	m_ll_active = false;
+
 	// set the exception PC
 	m_cop0[COP0_EPC] = m_pc;
 

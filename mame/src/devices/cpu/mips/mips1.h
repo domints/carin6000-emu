@@ -11,6 +11,17 @@ class mips1core_device_base : public cpu_device
 public:
 	// device configuration
 	void set_endianness(endianness_t endianness) { m_endianness = endianness; }
+	// MIPS II branch-likely (BEQL/BNEL/BLEZL/BGTZL and the REGIMM forms). MIPS I
+	// cores execute the REGIMM forms as the non-likely branch; leave this off for those.
+	void set_branch_likely(bool enable) { m_branch_likely = enable; }
+	// Bypass the cache model: needed when other bus masters (DMA) write memory the CPU
+	// has cached, or when kseg2 of a TLB-less core holds I/O registers.
+	void set_no_cache(bool enable) { m_no_cache = enable; }
+	// TX39-style three-operand MULT/MULTU, which also write the low product to rd.
+	void set_mult_rd(bool enable) { m_mult_rd = enable; }
+	// Let user mode read and execute kseg0/kseg1. OS-9000 on the DVD90 enters user
+	// processes at their kseg0 load address.
+	void set_user_kseg(bool enable) { m_user_kseg = enable; }
 
 	// input lines
 	template <unsigned Coprocessor> auto in_brcond() { return m_in_brcond[Coprocessor].bind(); }
@@ -39,6 +50,7 @@ protected:
 	// exceptions
 	void generate_exception(u32 exception, bool refill = false);
 	void address_error(int intention, u32 const address);
+	void take_branch(bool condition, bool likely, bool link, u32 const op);
 
 	// cop0
 	virtual void handle_cop0(u32 const op);
@@ -136,6 +148,12 @@ protected:
 	// I/O
 	devcb_read_line::array<4> m_in_brcond;
 	bool m_bus_error;
+	bool m_branch_likely;
+	bool m_no_cache;
+	bool m_mult_rd;
+	bool m_user_kseg;
+	bool m_ll_active;
+	u32 m_exc_log;
 };
 
 class mips1_device_base : public mips1core_device_base
