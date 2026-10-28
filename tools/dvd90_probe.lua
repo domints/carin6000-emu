@@ -29,9 +29,52 @@ local function word(addr)
 	return space:read_u32(phys(addr) & ~3)
 end
 
+local navi_field
+local ports_listed = false
+local function press_navi(down)
+	if not ports_listed then
+		ports_listed = true
+		for tag, port in pairs(machine.ioport.ports) do
+			local names = {}
+			for name, field in pairs(port.fields) do
+				names[#names + 1] = name
+				if name == "NAVI" then
+					navi_field = field
+				end
+			end
+			log(string.format("PORT %s fields %s", tag, table.concat(names, ",")))
+		end
+	end
+	if navi_field then
+		navi_field:set_value(down and 1 or 0)
+	end
+end
+
+local buckets = {}
+local last_bucket_log = -1
 emu.register_frame_done(function()
-	if done or machine.time:as_double() < probe_at then
+	local now = machine.time:as_double()
+	if os.getenv("PROBE_NAVI") then
+		press_navi(now >= 10 and now < 12)
+	end
+	local pc = reg("PC")
+	local bucket = pc & 0xffff0000
+	buckets[bucket] = (buckets[bucket] or 0) + 1
+	local second = math.floor(now)
+	if second ~= last_bucket_log and second < probe_at then
+		last_bucket_log = second
+		log(string.format("t=%d PC=%08X", second, pc))
+	end
+	if done or now < probe_at then
 		return
+	end
+	local keys = {}
+	for bucket in pairs(buckets) do
+		keys[#keys + 1] = bucket
+	end
+	table.sort(keys)
+	for _, bucket in ipairs(keys) do
+		log(string.format("PC %08X x%d", bucket, buckets[bucket]))
 	end
 	done = true
 	local parts = {}

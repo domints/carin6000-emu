@@ -14,9 +14,18 @@
         40000000-41ffffff  same DRAM, kuseg image (user virtual 00000000)
         10000000-10001fff  8 KB SRAM           (kseg1 b0000000)
         1fc00000-          boot image lowboot  (kseg1 bfc00000, reset vector)
-        ff800000-ff80ffff  display controller (cgdc), driver dr_video
+        ff800000-ff80ffff  display controller (cgdc), driver dr_video.
+                           Panel is 400x234, from the romicons test pages.
+                           That is wider than the 320x240 limit of the CPU's
+                           own LCD controller, so this block is a separate one.
         ff900000-ff90ffff  RoadRunner peripherals (IDE glue, I2C, GPIO,
                            timers, system control, interrupt controller)
+        ff901000, ff901100 two I2C masters (dr_i2c_spf). +00 buffer pointer,
+                           +04 byte count, +08 control (bit 9 starts, bit 10
+                           is the second phase), +0c status (bit 5 done).
+                           The faceplate keys arrive from the slave at 0x50
+                           on this bus; the clickable panel is the owner's
+                           manual drawing.
         ff904100-ff9044ff  four UARTs, 0x100 apart. +08 status
                            (bit 1 rx ready, bit 12 tx empty), +10 data
         ff910000-ff91ffff  interrupt sub-controller, 16550 debug UART
@@ -42,9 +51,12 @@
     +0c destination (physical), +10 byte count, +14 mode, +18 status
     (bit 23 done, bits 19-22 error).
 
-    The map disc (cd/NAV_DB_21709.iso) belongs on the ASIC's ATAPI port,
-    which is not wired up yet. The TLCS-900 radio CPU sits on the other side
-    of a UART / DIPC link and is not emulated.
+    The map disc is a plain ISO (OPEL_CDROM, cd/NAV_DB_21709.iso). It is
+    opened on the first READ CAPACITY or READ, not at startup: parsing the
+    4 GB file during machine start blows the run's wall clock. The file
+    manager mounts it through this ATAPI port and dbd then looks for
+    DB/DB_0. The TLCS-900 radio CPU sits on the other side of a UART /
+    DIPC link and is not emulated.
 
 ***************************************************************************/
 
@@ -52,6 +64,8 @@
 #include "cpu/mips/mips1.h"
 #include "imagedev/cdromimg.h"
 #include "screen.h"
+
+#include "dvd90.lh"
 
 #include <bit>
 #include <cstdlib>
@@ -119,6 +133,8 @@ public:
 		: driver_device(mconfig, type, tag)
 		, m_navcpu(*this, "navcpu")
 		, m_cdrom(*this, "cdrom")
+		, m_panel(*this, "PANEL")
+		, m_pad(*this, "PAD")
 	{ }
 
 	void opel_dvd90(machine_config &config);
@@ -138,6 +154,10 @@ private:
 	bool uart_w(offs_t address, uint32_t data, uint32_t mem_mask);
 	void uart_flush(unsigned channel);
 	void log_asic(const char *dir, offs_t address, uint32_t data, uint32_t mem_mask);
+	bool i2c_r(offs_t address, uint32_t &data);
+	void i2c_watch(offs_t address);
+	void i2c_put(uint32_t ptr, uint32_t len, uint8_t const *bytes);
+	uint8_t panel_code() const;
 	uint32_t unmapped_r(offs_t offset, uint32_t mem_mask);
 	void unmapped_w(offs_t offset, uint32_t data, uint32_t mem_mask);
 	void heartbeat(int param);
@@ -153,11 +173,13 @@ private:
 	bool irq_r(offs_t address, uint32_t &data);
 	bool irq_w(offs_t address, uint32_t data, uint32_t mem_mask);
 	void irq_sync();
+	void video_vblank(int state);
 
 	bool cd_r(offs_t address, uint32_t &data);
 	bool cd_w(offs_t address, uint32_t data, uint32_t mem_mask);
 	void cd_command(uint8_t command);
 	void cd_packet();
+	bool cd_image();
 	uint8_t cd_byte(uint32_t index);
 	uint32_t timer_now() const;
 
@@ -175,6 +197,8 @@ private:
 
 	required_device<r3041_device> m_navcpu;
 	required_device<cdrom_image_device> m_cdrom;
+	required_ioport m_panel;
+	required_ioport m_pad;
 
 	emu_timer *m_heartbeat = nullptr;
 	emu_timer *m_pit[8] = { };
@@ -202,12 +226,23 @@ private:
 	uint32_t m_cd_irq = 0;
 	uint32_t m_cd_vector = 0;
 	uint8_t m_cd_status = 0x50;
+	// The map ISO, opened on the first command that needs a sector. Held
+	// open so a later read of DB/DB_0 does not parse the file again.
+	std::ifstream m_iso;
+	uint32_t m_iso_sectors = 0;
+	bool m_iso_tried = false;
 	uint32_t m_irq_mask0 = 0;
 	uint32_t m_irq_mask1 = 0;
 	uint32_t m_irq_pair = 0;
 	uint32_t m_irq_status = 0;
 	uint32_t m_irq_index = 0;
+	uint32_t m_video_irq = 0;
 	uint32_t m_asic_log = 0;
+	uint32_t m_i2c_log = 0;
+	uint32_t m_i2c_status[2] = { };
+	uint32_t m_i2c_ctrl[2] = { };
+	uint32_t m_i2c_irq = 0;
+	uint8_t m_i2c_held = 0;
 	uint32_t m_unmapped_log = 0;
 	uint32_t m_nand_log = 0;
 	std::unordered_map<offs_t, uint32_t> m_regs;
@@ -287,6 +322,10 @@ uint32_t opel_dvd90_state::asic_r(offs_t offset, uint32_t mem_mask)
 	if (cd_r(address, cd_data))
 		return cd_data;
 
+	uint32_t i2c_data = 0;
+	if (i2c_r(address, i2c_data))
+		return i2c_data;
+
 	uint32_t data = 0;
 	if (address >= DMA_BASE && address < DMA_BASE + 0x100)
 	{
@@ -321,6 +360,234 @@ void opel_dvd90_state::asic_w(offs_t offset, uint32_t data, uint32_t mem_mask)
 	log_asic("W", address, data, mem_mask);
 	uint32_t &reg = m_regs[address];
 	reg = (reg & ~mem_mask) | (data & mem_mask);
+	if (address == 0xff800100 && reg != 0)
+	{
+		static int noted;
+		if (noted < 12 && reg >= 0x1000 && reg + 416 * 234 < 0x02000000)
+		{
+			noted++;
+			address_space &mem = m_navcpu->space(AS_PROGRAM);
+			unsigned lo = 255, hi = 0;
+			unsigned distinct = 0;
+			uint8_t seen[256] = {};
+			for (int i = 0; i < 416 * 234; i++)
+			{
+				unsigned const c = mem.read_byte(reg + i);
+				if (!seen[c])
+				{
+					seen[c] = 1;
+					distinct++;
+				}
+				if (c < lo)
+					lo = c;
+				if (c > hi)
+					hi = c;
+			}
+			uint32_t const gp = uint32_t(m_navcpu->state_int(28)) & 0x1fffffff;
+			uint32_t win = 0;
+			uint32_t fields[8] = { };
+			uint32_t st = 0;
+			uint16_t panel_w = 0, panel_h = 0;
+			if (gp + 0x868 < 0x02000000)
+			{
+				panel_w = mem.read_word(gp + 0x860);
+				panel_h = mem.read_word(gp + 0x862);
+			}
+			if (gp + 0x24 < 0x02000000)
+			{
+				st = mem.read_dword(gp + 0x20) & 0x1fffffff;
+				if (st + 0x60 < 0x02000000)
+					win = mem.read_dword(st) & 0x1fffffff;
+			}
+			if (win + 0x60 < 0x02000000)
+			{
+				static const int off[8] = { 4, 8, 0xc, 0x10, 0x24, 0x28, 0x2c, 0x58 };
+				for (int n = 0; n < 8; n++)
+					fields[n] = mem.read_dword(win + off[n]);
+			}
+			uint32_t stride = 0, height = 0;
+			if (st + 0x40 < 0x02000000)
+			{
+				stride = mem.read_dword(st + 0x38);
+				height = mem.read_dword(st + 0x3c);
+			}
+			logerror("fb %08X = %08X idx %u..%u distinct %u panel %u x %u st %08X stride %u height %u win %08X x %d y %d w %d h %d src %08X %08X fl %08X nxt %08X\n",
+				address, reg, lo, hi, distinct, panel_w, panel_h, st, stride, height, win,
+				int32_t(fields[0]), int32_t(fields[1]), int32_t(fields[2]), int32_t(fields[3]),
+				fields[4], fields[5], fields[6], fields[7]);
+		}
+	}
+	// The picsub entry writes the source priority back to FFFEC008 once the
+	// handler has run. Dropping the line there stops the entry re-firing for
+	// the rest of the blanking interval.
+	if (address == 0xfffec008 && m_video_irq)
+	{
+		m_video_irq = 0;
+		irq_sync();
+	}
+	i2c_watch(address);
+}
+
+// dr_i2c_spf kicks a transfer by writing the buffer pointer, the length, then
+// the control word. Bit 9 is the first phase and bit 10 the second. The
+// poll at file 0x15714c treats status bit 5 as "the phase finished", and the
+// service routine at file 0x15a41c treats status bit 0 as its interrupt.
+// Port FF901000 is installed as irq 0x53 (cause index 3). The first phase is
+// left pending so init still reaches the second write; the second phase
+// completes and raises that interrupt so the driver collects the buffer.
+bool opel_dvd90_state::i2c_r(offs_t address, uint32_t &data)
+{
+	unsigned channel = 0;
+	if (address == 0xff90100c)
+		channel = 0;
+	else if (address == 0xff90110c)
+		channel = 1;
+	else
+		return false;
+	data = m_i2c_status[channel];
+	// Bit 0 is level triggered. The service routine reads it once and then
+	// returns; leaving it set re-enters the routine and wedges the CPU.
+	if ((m_i2c_irq & (1u << channel)) && !machine().side_effects_disabled())
+	{
+		// Bit 8 is "this completion carries the buffer". Drop it with bit 0
+		// so the next idle poll is not delivered as another key.
+		m_i2c_status[channel] &= ~uint32_t(0x101);
+		m_i2c_irq &= ~(1u << channel);
+		if (m_i2c_log < 80)
+		{
+			m_i2c_log++;
+			logerror("i2c%u %s status %08X\n", channel, machine().describe_context(), data);
+		}
+		irq_sync();
+	}
+	log_asic("R", address, data, 0xffffffff);
+	return true;
+}
+
+// dr_i2cnal's read path takes the key from the first byte of the 16-byte
+// panel buffer (the driver's struct+0x24c, which is the DMA target). The
+// value is the code i2c_dipc_key_event dispatches on, from the jump table
+// at file 0x1ca8 of usw_stdprocs. 0x44 is NAVI.
+uint8_t opel_dvd90_state::panel_code() const
+{
+	uint32_t const keys = m_panel->read();
+	uint32_t const pad = m_pad->read();
+	if (keys & 0x0001)
+		return 0x44; // NAVI
+	if (keys & 0x0002)
+		return 0xe0; // MAIN
+	if (keys & 0x0004)
+		return 0xfe; // INFO
+	if (keys & 0x0008)
+		return 0x42; // SOUND
+	if (keys & 0x0010)
+		return 0x41; // AUDIO
+	if (keys & 0x0020)
+		return 0x01; // BC
+	if (keys & 0x0040)
+		return 0xff; // SETTINGS
+	if (keys & 0x0100)
+		return 0x10; // eject NAVI, CD_EJECT
+	if (pad & 0x0001)
+		return 0x6c; // up
+	if (pad & 0x0002)
+		return 0x6d; // down
+	if (pad & 0x0008)
+		return 0x6e; // right
+	if (pad & 0x0004)
+		return 0x6f; // left
+	return 0;
+}
+
+void opel_dvd90_state::i2c_put(uint32_t ptr, uint32_t len, uint8_t const *bytes)
+{
+	uint32_t phys = ptr;
+	if (phys >= 0x80000000 && phys < 0xc0000000)
+		phys &= 0x1fffffff;
+	else if (phys >= 0x40000000 && phys < 0x42000000)
+		phys -= 0x40000000;
+	if (phys >= 0x02000000)
+		return;
+	address_space &space = m_navcpu->space(AS_PROGRAM);
+	for (uint32_t i = 0; i < len && i < 16; i++)
+		space.write_byte(phys + i, bytes[i]);
+}
+
+void opel_dvd90_state::i2c_watch(offs_t address)
+{
+	if (address != 0xff901008 && address != 0xff901108)
+		return;
+	offs_t const base = address & ~offs_t(0xff);
+	uint32_t const ctrl = m_regs[address];
+	uint32_t const len = m_regs[base + 4];
+	uint32_t const ptr = m_regs[base];
+	unsigned const channel = base == 0xff901100 ? 1 : 0;
+	// The service routine acks by keeping bits 0, 3 and 10 and setting bit 2.
+	if ((ctrl & ~uint32_t(0x509)) == 4 && (m_i2c_irq & (1u << channel)))
+	{
+		m_i2c_irq &= ~(1u << channel);
+		m_i2c_status[channel] &= ~uint32_t(0x101);
+		if (m_i2c_log < 80)
+		{
+			m_i2c_log++;
+			logerror("i2c%u %s ack ctrl=%08X\n", channel, machine().describe_context(), ctrl);
+		}
+		irq_sync();
+	}
+	// GPIO on the same block toggles the control bits with no length programmed.
+	if (len == 0 || len > 64)
+		return;
+	uint32_t const prev = m_i2c_ctrl[channel];
+	m_i2c_ctrl[channel] = ctrl;
+	bool const rise200 = (ctrl & 0x200) && !(prev & 0x200);
+	bool const rise400 = (ctrl & 0x400) && !(prev & 0x400);
+	if (rise400)
+	{
+		m_i2c_status[channel] |= 0x20;
+		// The panel master is the port at FF901000. Bit 0 is what its
+		// service routine claims; the tuner port is left quiet.
+		if (channel == 0)
+		{
+			uint8_t const code = panel_code();
+			if (code != m_i2c_held)
+			{
+				uint8_t frame[16] = { };
+				frame[0] = code;
+				i2c_put(ptr, len, frame);
+				m_i2c_held = code;
+				if (code)
+				{
+					// Bit 8 is the service routine's "the buffer holds data" flag.
+					m_i2c_status[channel] |= 0x100;
+					logerror("i2c key code=%02X\n", code);
+				}
+			}
+			m_i2c_status[channel] |= 0x01;
+			m_i2c_irq |= 1;
+			irq_sync();
+		}
+	}
+	else if (!(ctrl & 0x600))
+		m_i2c_status[channel] &= ~uint32_t(0x20);
+	if (!(rise200 || rise400) || machine().side_effects_disabled() || m_i2c_log >= 80)
+		return;
+	m_i2c_log++;
+	uint32_t phys = ptr;
+	if (phys >= 0x80000000 && phys < 0xc0000000)
+		phys &= 0x1fffffff;
+	else if (phys >= 0x40000000 && phys < 0x42000000)
+		phys -= 0x40000000;
+	std::string bytes;
+	address_space &space = m_navcpu->space(AS_PROGRAM);
+	for (uint32_t i = 0; i < len; i++)
+	{
+		uint8_t const b = (phys + i < 0x02000000) ? space.read_byte(phys + i) : 0;
+		bytes.push_back("0123456789ABCDEF"[b >> 4]);
+		bytes.push_back("0123456789ABCDEF"[b & 0xf]);
+		bytes.push_back(' ');
+	}
+	logerror("i2c%u %s ctrl=%08X ptr=%08X len=%u panel=%X pad=%X data=%s\n",
+		channel, machine().describe_context(), ctrl, ptr, len, m_panel->read(), m_pad->read(), bytes.c_str());
 }
 
 // lowboot's console driver. Four channels at ff904100, ff904200, ff904300 and
@@ -749,6 +1016,14 @@ bool opel_dvd90_state::timer_r(offs_t address, uint32_t &data)
 		data = timer_now();
 		return true;
 	}
+	// dr_io / dr_syscon poll bit 16 of FF905008 and sleep until it reads as
+	// set. Leaving it clear stalls ghandler inside its iopins call, so the
+	// UI never asks the display controller for a framebuffer.
+	if (address == 0xff905008)
+	{
+		data = 0x00010000;
+		return true;
+	}
 	switch (address)
 	{
 	case 0xff905100: data = m_tcu_ctrl; break;
@@ -937,6 +1212,17 @@ bool opel_dvd90_state::irq_w(offs_t address, uint32_t data, uint32_t mem_mask)
 	return true;
 }
 
+void opel_dvd90_state::video_vblank(int state)
+{
+	// dr_video installs vector 0x58, which is the low byte of FFFEC018.
+	// Asserting a picsub line before that byte is published makes the early
+	// interrupt entry re-enter forever, so the line stays down until then.
+	auto const slot = m_regs.find(0xfffec018);
+	bool const armed = slot != m_regs.end() && (slot->second & 0xff) != 0;
+	m_video_irq = (state && armed) ? 1 : 0;
+	irq_sync();
+}
+
 void opel_dvd90_state::irq_sync()
 {
 	// Cause bits 10-15 are the source index (irq number minus 0x50), not a
@@ -951,6 +1237,14 @@ void opel_dvd90_state::irq_sync()
 	else if (!m_uart_rx[0].empty())
 		// scspiluart's console sits on the first port, dispatch slot 0x60.
 		index = 0x10;
+	else if (m_i2c_irq & 1)
+		// dr_i2c_spf installs FF901000 as irq 0x53.
+		index = 3;
+	else if (m_i2c_irq & 2)
+		index = 2;
+	else if (m_video_irq)
+		// dr_video's vblank service is vector 0x58.
+		index = 0x08;
 	if (index == m_irq_index)
 		return;
 	m_irq_index = index;
@@ -1138,7 +1432,9 @@ void opel_dvd90_state::cd_packet()
 		break;
 	case 0x25:
 	{
-		uint32_t const last = m_cdrom->exists() ? m_cdrom->get_track_start(0xaa) - 1 : 0;
+		uint32_t last = 0;
+		if (cd_image())
+			last = m_iso_sectors ? m_iso_sectors - 1 : m_cdrom->get_track_start(0xaa) - 1;
 		m_cd_buf[0] = last >> 24;
 		m_cd_buf[1] = last >> 16;
 		m_cd_buf[2] = last >> 8;
@@ -1150,7 +1446,7 @@ void opel_dvd90_state::cd_packet()
 	}
 	case 0x28:
 	case 0xa8:
-		if (length != 0 && m_cdrom->exists())
+		if (length != 0 && cd_image())
 		{
 			m_cd_lba = lba;
 			m_cd_count = length * 2048;
@@ -1179,6 +1475,31 @@ void opel_dvd90_state::cd_packet()
 	m_cd_reg[0x70 >> 2] |= 1;
 }
 
+// Opened here rather than at machine start. MAME's cdrom image device
+// parses the whole ISO while the NAND image is still being copied, and that
+// pair exceeds the run's wall clock. A seek to one 2048-byte sector does not.
+bool opel_dvd90_state::cd_image()
+{
+	if (m_iso_tried)
+		return m_iso_sectors != 0 || m_cdrom->exists();
+	m_iso_tried = true;
+	char const *path = std::getenv("OPEL_CDROM");
+	if (path && path[0])
+	{
+		m_iso.open(path, std::ios::binary);
+		if (m_iso)
+		{
+			m_iso.seekg(0, std::ios::end);
+			std::streamoff const bytes = m_iso.tellg();
+			m_iso_sectors = bytes > 0 ? uint32_t(uint64_t(bytes) / 2048) : 0;
+			logerror("cd image %s (%u sectors)\n", path, m_iso_sectors);
+		}
+		else
+			logerror("cd image open failed %s\n", path);
+	}
+	return m_iso_sectors != 0 || m_cdrom->exists();
+}
+
 uint8_t opel_dvd90_state::cd_byte(uint32_t index)
 {
 	if (m_cd_lba != 0xffffffff)
@@ -1186,14 +1507,23 @@ uint8_t opel_dvd90_state::cd_byte(uint32_t index)
 		uint32_t const lba = m_cd_lba + index / 2048;
 		if (lba != m_cd_cached)
 		{
-			uint8_t raw[2448] = { };
-			bool ok = m_cdrom->exists() && m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_MODE1);
-			if (!ok && m_cdrom->exists())
-				ok = m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_RAW_DONTCARE);
-			if (ok)
-				std::copy_n(raw, 2048, m_cd_cache);
-			else
-				std::fill_n(m_cd_cache, 2048, 0);
+			std::fill_n(m_cd_cache, 2048, 0);
+			if (m_iso_sectors != 0 && lba < m_iso_sectors)
+			{
+				m_iso.clear();
+				m_iso.seekg(std::streamoff(uint64_t(lba) * 2048));
+				m_iso.read(reinterpret_cast<char *>(m_cd_cache), 2048);
+				m_iso.clear();
+			}
+			else if (m_cdrom->exists())
+			{
+				uint8_t raw[2448] = { };
+				bool ok = m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_MODE1);
+				if (!ok)
+					ok = m_cdrom->read_data(lba, raw, cdrom_file::CD_TRACK_RAW_DONTCARE);
+				if (ok)
+					std::copy_n(raw, 2048, m_cd_cache);
+			}
 			m_cd_cached = lba;
 		}
 		return m_cd_cache[index % 2048];
@@ -1218,6 +1548,11 @@ void opel_dvd90_state::machine_start()
 	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&opel_dvd90_state::machine_stop, this));
 
 	save_item(NAME(m_asic_log));
+	save_item(NAME(m_i2c_log));
+	save_item(NAME(m_i2c_status));
+	save_item(NAME(m_i2c_ctrl));
+	save_item(NAME(m_i2c_irq));
+	save_item(NAME(m_i2c_held));
 	save_item(NAME(m_unmapped_log));
 	m_heartbeat = timer_alloc(FUNC(opel_dvd90_state::heartbeat), this);
 	m_heartbeat->adjust(attotime::from_msec(500), 0, attotime::from_msec(500));
@@ -1240,6 +1575,7 @@ void opel_dvd90_state::machine_reset()
 	m_irq_pair = 0;
 	m_irq_status = 0;
 	m_irq_index = 0;
+	m_video_irq = 0;
 	m_tcu_ctrl = 0;
 	m_tcu_scale = 0;
 	m_tcu_period = 0;
@@ -1271,6 +1607,13 @@ void opel_dvd90_state::machine_reset()
 	for (std::string &rx : m_uart_rx)
 		rx.clear();
 	m_regs.clear();
+	m_i2c_log = 0;
+	m_i2c_status[0] = 0;
+	m_i2c_status[1] = 0;
+	m_i2c_ctrl[0] = 0;
+	m_i2c_ctrl[1] = 0;
+	m_i2c_irq = 0;
+	m_i2c_held = 0;
 	m_nand_ctrl = 0;
 	m_nand_cmd = 0;
 	m_nand_addr_count = 0;
@@ -1284,8 +1627,60 @@ void opel_dvd90_state::machine_reset()
 
 void opel_dvd90_state::machine_stop()
 {
+	// Which OS-9 modules made it into RAM. A loaded module starts with 4D AD.
+	address_space &space = m_navcpu->space(AS_PROGRAM);
+	for (uint32_t addr = 0; addr + 0x20 < 0x02000000; addr += 4)
+	{
+		if (space.read_dword(addr) != 0x4dad0002)
+			continue;
+		uint32_t const name_at = space.read_dword(addr + 0x0c);
+		if (name_at == 0 || name_at >= 0x80)
+			continue;
+		char name[20] = { };
+		bool ok = true;
+		for (int i = 0; i < 19; i++)
+		{
+			uint8_t const c = space.read_byte(addr + name_at + i);
+			if (c == 0)
+				break;
+			if (c < 32 || c > 126)
+			{
+				ok = false;
+				break;
+			}
+			name[i] = char(c);
+		}
+		if (ok && name[0])
+			logerror("loaded %08X %s\n", addr, name);
+	}
 	for (unsigned channel = 0; channel < 4; channel++)
 		uart_flush(channel);
+	// The headless run never presents the bitmap. Keep the last frame so a
+	// black panel can be told from a real one.
+	auto const frame = m_regs.find(0xff800100);
+	if (frame != m_regs.end() && frame->second >= 0x1000 && frame->second + 416 * 234 < 0x02000000)
+	{
+		address_space &mem = m_navcpu->space(AS_PROGRAM);
+		std::ofstream ppm("panel.ppm", std::ios::binary);
+		ppm << "P6\n400 234\n255\n";
+		for (int y = 0; y < 234; y++)
+		{
+			uint32_t const row = frame->second + y * 416;
+			for (int x = 0; x < 400; x++)
+			{
+				auto const entry = m_regs.find(0xff800c00 + mem.read_byte(row + x) * 4);
+				uint32_t const p = entry == m_regs.end() ? 0 : entry->second;
+				uint32_t const r = (p >> 10) & 0x1f;
+				uint32_t const g = (p >> 5) & 0x1f;
+				uint32_t const b = p & 0x1f;
+				char const rgb[3] = {
+					char((r << 3) | (r >> 2)),
+					char((g << 3) | (g >> 2)),
+					char((b << 3) | (b >> 2)) };
+				ppm.write(rgb, 3);
+			}
+		}
+	}
 	if (m_nand_dirty && !m_nand_path.empty())
 	{
 		std::ofstream out(m_nand_path, std::ios::binary);
@@ -1296,10 +1691,76 @@ void opel_dvd90_state::machine_stop()
 uint32_t opel_dvd90_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
 {
 	bitmap.fill(rgb_t::black(), cliprect);
+	// FF800100 is the byte framebuffer dr_video flips every vblank. The two
+	// buffers are 416 apart per line and 234 lines high, which is the panel
+	// height; the visible width is the 400 the timing leaves after the border.
+	// Palette words at FF800C00 are RGB555, built by the ramp at dr_video
+	// 0x3408: five bits at positions 10, 5 and 0.
+	auto const ptr = m_regs.find(0xff800100);
+	if (ptr == m_regs.end())
+		return 0;
+	uint32_t const base = ptr->second;
+	if (base < 0x1000 || base + 416 * 234 >= 0x02000000)
+		return 0;
+	address_space &mem = m_navcpu->space(AS_PROGRAM);
+	uint32_t pal[256];
+	for (int i = 0; i < 256; i++)
+	{
+		auto const entry = m_regs.find(0xff800c00 + i * 4);
+		uint32_t const p = entry == m_regs.end() ? 0 : entry->second;
+		uint32_t const r = (p >> 10) & 0x1f;
+		uint32_t const g = (p >> 5) & 0x1f;
+		uint32_t const b = p & 0x1f;
+		pal[i] = rgb_t((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2));
+	}
+	for (int y = cliprect.min_y; y <= cliprect.max_y && y < 234; y++)
+	{
+		uint32_t const row = base + y * 416;
+		for (int x = cliprect.min_x; x <= cliprect.max_x && x < 400; x++)
+			bitmap.pix(y, x) = pal[mem.read_byte(row + x)];
+	}
 	return 0;
 }
 
+// Callout numbers are the ones printed on the owner's-manual drawing.
+// PANEL is the labelled keys and the two knobs. PAD is the four-way pad and
+// the numeric block (1-9, lock, 0, phone).
 static INPUT_PORTS_START(opel_dvd90)
+	PORT_START("PANEL")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_BUTTON1)  PORT_NAME("NAVI")            PORT_CODE(KEYCODE_N)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_BUTTON2)  PORT_NAME("MAIN")            PORT_CODE(KEYCODE_M)
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_BUTTON3)  PORT_NAME("INFO")            PORT_CODE(KEYCODE_I)
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_BUTTON4)  PORT_NAME("SOUND")           PORT_CODE(KEYCODE_S)
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_BUTTON5)  PORT_NAME("AUDIO")           PORT_CODE(KEYCODE_A)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_BUTTON6)  PORT_NAME("BC")              PORT_CODE(KEYCODE_B)
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_BUTTON7)  PORT_NAME("SETTINGS")        PORT_CODE(KEYCODE_O)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_BUTTON8)  PORT_NAME("TP")              PORT_CODE(KEYCODE_T)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_BUTTON9)  PORT_NAME("Eject NAVI")      PORT_CODE(KEYCODE_E)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_BUTTON10) PORT_NAME("Eject AUDIO")     PORT_CODE(KEYCODE_R)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_BUTTON11) PORT_NAME("Power")           PORT_CODE(KEYCODE_P)
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_BUTTON12) PORT_NAME("Volume +")        PORT_CODE(KEYCODE_EQUALS)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_BUTTON13) PORT_NAME("Volume -")        PORT_CODE(KEYCODE_MINUS)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_BUTTON14) PORT_NAME("Knob push")       PORT_CODE(KEYCODE_ENTER)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_BUTTON15) PORT_NAME("Knob left")       PORT_CODE(KEYCODE_OPENBRACE)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_BUTTON16) PORT_NAME("Knob right")      PORT_CODE(KEYCODE_CLOSEBRACE)
+
+	PORT_START("PAD")
+	PORT_BIT(0x0001, IP_ACTIVE_HIGH, IPT_JOYSTICK_UP)    PORT_NAME("Up")    PORT_CODE(KEYCODE_UP)
+	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_JOYSTICK_DOWN)  PORT_NAME("Down")  PORT_CODE(KEYCODE_DOWN)
+	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_JOYSTICK_LEFT)  PORT_NAME("Left")  PORT_CODE(KEYCODE_LEFT)
+	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_JOYSTICK_RIGHT) PORT_NAME("Right") PORT_CODE(KEYCODE_RIGHT)
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_BUTTON1)  PORT_NAME("1")     PORT_CODE(KEYCODE_1)
+	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_BUTTON2)  PORT_NAME("2")     PORT_CODE(KEYCODE_2)
+	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_BUTTON3)  PORT_NAME("3")     PORT_CODE(KEYCODE_3)
+	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_BUTTON4)  PORT_NAME("4")     PORT_CODE(KEYCODE_4)
+	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_BUTTON5)  PORT_NAME("5")     PORT_CODE(KEYCODE_5)
+	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_BUTTON6)  PORT_NAME("6")     PORT_CODE(KEYCODE_6)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_BUTTON7)  PORT_NAME("7")     PORT_CODE(KEYCODE_7)
+	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_BUTTON8)  PORT_NAME("8")     PORT_CODE(KEYCODE_8)
+	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_BUTTON9)  PORT_NAME("9")     PORT_CODE(KEYCODE_9)
+	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_BUTTON10) PORT_NAME("0")     PORT_CODE(KEYCODE_0)
+	PORT_BIT(0x4000, IP_ACTIVE_HIGH, IPT_BUTTON11) PORT_NAME("Lock")  PORT_CODE(KEYCODE_L)
+	PORT_BIT(0x8000, IP_ACTIVE_HIGH, IPT_BUTTON12) PORT_NAME("Phone") PORT_CODE(KEYCODE_H)
 INPUT_PORTS_END
 
 void opel_dvd90_state::opel_dvd90(machine_config &config)
@@ -1316,11 +1777,20 @@ void opel_dvd90_state::opel_dvd90(machine_config &config)
 	m_navcpu->set_addrmap(AS_PROGRAM, &opel_dvd90_state::navcpu_map);
 
 	screen_device &screen(SCREEN(config, "screen"));
-	screen.set_refresh_hz(50);
+	// dr_video times 32 vblanks and rejects the panel mode unless that span
+	// is short enough for a 400-pixel line. The timing it programs (horizontal
+	// total 490) only fits the panel at this rate.
+	screen.set_refresh_hz(200);
 	screen.set_vblank_time(ATTOSECONDS_IN_USEC(2500));
-	screen.set_size(320, 240);
-	screen.set_visarea(0, 319, 0, 239);
+	// romicons RGB test page 1 is 400x234. Pages 2-5 are 394x228, inset by
+	// the 6 the timing registers at FF800704 and FF800708 are programmed with.
+	// Horizontal total in the fallback timing is 490, so the scan is wider
+	// than the visible panel.
+	screen.set_size(400, 234);
+	screen.set_visarea(0, 399, 0, 233);
 	screen.set_screen_update(FUNC(opel_dvd90_state::screen_update));
+	screen.screen_vblank().set(FUNC(opel_dvd90_state::video_vblank));
+	config.set_default_layout(layout_dvd90);
 
 	// Map DVD. The ASIC ATAPI port is not emulated yet; the image is only mounted.
 	CDROM(config, m_cdrom).set_interface("cdrom");

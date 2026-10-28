@@ -14,6 +14,11 @@ volume with the files lowboot looks for:
   /COMPUNIT/NAV/CODE/NAVBOOT      OS-9000 bootfile of the navigation system
   /COMPUNIT/NAV/CODE/BSW2         basic software the supervisor modloads
   /COMPUNIT/NAV/CODE/PERMIS.TIB
+  /COMPUNIT/NAV/CODE/usw_modules  fonts, including the one the MMI prints with
+  /COMPUNIT/NAV/CODE/usw_stdprocs screen builder and the other MMI processes
+  /COMPUNIT/NAV/CODE/usw_bsiprocs map and guidance processes
+  /COMPUNIT/NAV/CODE/usw_tools
+  /COMPUNIT/NAV/CODE/USW_LOAD.CFG catalog that maps those processes to the files
   /COMPUNIT/NAV/DATA/NAV_SSW.TIB  DIPC startup arguments read by sysgo
   /COMPUNIT/NVR3/NVRIMGA,B        NVR backing files expected by sysgo
   /COMPUNIT/DATA/COMPUNIT.TIB     I2C routing table read by dr_i2cnal
@@ -123,10 +128,55 @@ class Fat12:
     @staticmethod
     def name83(name):
         name = name.upper()
-        base, _, ext = name.partition(".")
-        if len(base) > 8 or len(ext) > 3:
-            raise SystemExit(f"{name}: not an 8.3 name")
+        base, dot, ext = name.partition(".")
+        if not base or len(base) > 8 or len(ext) > 3 or (dot and "." in ext):
+            return None
         return base.ljust(8).encode() + ext.ljust(3).encode()
+
+    def alias83(self, name, used):
+        """8.3 stand-in for a long name. The long name itself is stored in VFAT entries."""
+        upper = name.upper()
+        base, _, ext = upper.partition(".")
+        stem = "".join(ch for ch in base if ch not in " .+,;=[]")[:6]
+        tail = "".join(ch for ch in ext if ch not in " .+,;=[]")[:3]
+        number = 1
+        while True:
+            short = f"{stem}~{number}".ljust(8).encode()[:8] + tail.ljust(3).encode()
+            if short not in used:
+                used.add(short)
+                return short
+            number += 1
+
+    @staticmethod
+    def lfn_checksum(name11):
+        total = 0
+        for byte in name11:
+            total = (((total & 1) << 7) + (total >> 1) + byte) & 0xFF
+        return total
+
+    @staticmethod
+    def lfn_entries(name, name11):
+        """VFAT long-name slots, last slot first, each holding 13 UTF-16 characters."""
+        chars = [ord(ch) for ch in name]
+        chars.append(0)
+        while len(chars) % 13:
+            chars.append(0xFFFF)
+        checksum = Fat12.lfn_checksum(name11)
+        slots = []
+        count = len(chars) // 13
+        for seq in range(count, 0, -1):
+            chunk = chars[(seq - 1) * 13:seq * 13]
+            entry = bytearray(32)
+            entry[0] = seq | (0x40 if seq == count else 0)
+            for index, offset in enumerate((1, 3, 5, 7, 9)):
+                struct.pack_into("<H", entry, offset, chunk[index])
+            entry[11] = 0x0F
+            entry[13] = checksum
+            for index, offset in enumerate((14, 16, 18, 20, 22, 24)):
+                struct.pack_into("<H", entry, offset, chunk[5 + index])
+            struct.pack_into("<HH", entry, 28, chunk[11], chunk[12])
+            slots.append(bytes(entry))
+        return slots
 
     @staticmethod
     def entry(name83, attr, cluster, size):
@@ -138,7 +188,17 @@ class Fat12:
     def build_dir(self, tree, parent_cluster, self_cluster_holder):
         """tree: dict name -> bytes (file) or dict (directory). Returns entries for this level."""
         entries = []
+        used = set()
         for name, node in tree.items():
+            short = self.name83(name)
+            if short is None:
+                short = self.alias83(name, used)
+                prelude = self.lfn_entries(name, short)
+            else:
+                if short in used:
+                    raise SystemExit(f"{name}: short name already used")
+                used.add(short)
+                prelude = []
             if isinstance(node, dict):
                 holder = [0]
                 # reserve a cluster for the directory first, fill it afterwards
@@ -151,10 +211,12 @@ class Fat12:
                 if len(blob) > CLUSTER_BYTES:
                     raise SystemExit(f"directory {name} too large")
                 self.clusters[cluster] = blob.ljust(CLUSTER_BYTES, b"\0")
-                entries.append(self.entry(self.name83(name), 0x10, cluster, 0))
+                entries += prelude
+                entries.append(self.entry(short, 0x10, cluster, 0))
             else:
                 cluster = self.alloc(node)
-                entries.append(self.entry(self.name83(name), 0x20, cluster, len(node)))
+                entries += prelude
+                entries.append(self.entry(short, 0x20, cluster, len(node)))
         return entries
 
     def image(self, tree):
@@ -296,6 +358,10 @@ def nav_ssw_tib():
     The runtime prints its usage and exits unless it gets at least one option,
     and the DIPC servers then fail to open the pipe it would have created.
     -n keeps it running without waiting for a network connection.
+
+    ShellExecEnabled and DevelopmentMode are left unset. A set ShellExecEnabled
+    makes sysgo take the development path, and that path jumps over the fork of
+    mmi_root. With the keys absent the lookup returns 0 and sysgo forks the MMI.
     """
     return (
         "TIB_v1\n"
@@ -303,12 +369,6 @@ def nav_ssw_tib():
         "\n"
         "[DipcRuntime]\n"
         "StartupParams=-n\n"
-        "\n"
-        "[Diagnostics]\n"
-        "ShellExecEnabled=1\n"
-        "\n"
-        "[Development]\n"
-        "DevelopmentMode=1\n"
     ).encode()
 
 
@@ -319,7 +379,10 @@ def nvr_image():
     sector with a 55 AA signature, 512-byte sectors, two FATs, a non-zero root
     directory and a FAT of 1..127 sectors.
     """
-    sectors = 8
+    # config_tool writes a 2928-byte file here. At one sector per cluster the
+    # old 8-sector partition had four data clusters, three of them free, so the
+    # allocation search wrapped forever instead of returning disk-full.
+    sectors = CLUSTER_BYTES // PAGE - 1
     image = bytearray(CLUSTER_BYTES)
     entry = bytearray(16)
     entry[0] = 0x80
@@ -353,6 +416,21 @@ def nvr_image():
     return bytes(image)
 
 
+def os9_module(blob, name):
+    """Return one OS-9000 module, located by the name in its header."""
+    want = name.encode() + b"\x00"
+    offset = 0
+    while True:
+        start = blob.find(b"\x4d\xad", offset)
+        if start < 0:
+            raise SystemExit(f"{name}: module not found")
+        name_at = int.from_bytes(blob[start + 0x0C:start + 0x10], "big")
+        size = int.from_bytes(blob[start + 4:start + 8], "big")
+        if 0 < name_at < 0x400 and 0 < size <= len(blob) - start and blob[start + name_at:start + name_at + len(want)] == want:
+            return blob[start:start + size]
+        offset = start + 2
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hw", default="0104", help="HVM0 hardware directory (default 0104, NAV-DVD production)")
@@ -361,19 +439,34 @@ def main():
 
     src = FIRMWARE / args.hw / "EHU4C"
     app = src / "app_sw"
+    navboot = (app / "navboot").read_bytes()
+    # mmi_root opens this catalog by its bare name, so it has to sit in whichever
+    # directory ends up being current. The long names are the paths the catalog lists.
+    load_cfg = os9_module(navboot, "usw_load.cfg")
     tree = {
+        "USW_LOAD.CFG": load_cfg,
         "COMPUNIT": {
+            "USW_LOAD.CFG": load_cfg,
             "BOOT": {
                 "CODE": {"LOWBOOT": (src / "lowboot").read_bytes()},
                 "DATA": {"BOOT.TIB": boot_tib()},
             },
             "NAV": {
+                "USW_LOAD.CFG": load_cfg,
                 "CODE": {
-                    "NAVBOOT": (app / "navboot").read_bytes(),
+                    "NAVBOOT": navboot,
                     "BSW2": (app / "bsw2").read_bytes(),
                     "PERMIS.TIB": (app / "permis.tib").read_bytes(),
+                    "USW_LOAD.CFG": load_cfg,
+                    "usw_modules": (app / "usw_modules").read_bytes(),
+                    "usw_stdprocs": (app / "usw_stdprocs").read_bytes(),
+                    "usw_bsiprocs": (app / "usw_bsiprocs").read_bytes(),
+                    "usw_tools": (app / "usw_tools").read_bytes(),
                 },
-                "DATA": {"NAV_SSW.TIB": nav_ssw_tib()},
+                "DATA": {
+                    "NAV_SSW.TIB": nav_ssw_tib(),
+                    "USW_LOAD.CFG": load_cfg,
+                },
             },
             "NVR3": {
                 "NVRIMGA": nvr_image(),

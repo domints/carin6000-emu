@@ -418,6 +418,39 @@ void mips1core_device_base::execute_run()
 		// fetch instruction
 		fetch(m_pc, [this](u32 const op)
 		{
+			// DVD90 sysgo turns signal 0x7f0c into event 0x13f and that event
+			// both prints "shutdown request" and latches power-off before any
+			// window has a size. Ignore that one branch (beq preceded by
+			// addiu t0,zero,0x13f) and the two latch stores. The encodings are
+			// specific to this firmware.
+			if (machine().system().name && !strcmp(machine().system().name, "opel_dvd90"))
+			{
+				offs_t const phys = m_pc & 0x1fffffff;
+				if (op == 0xad09000c && phys >= 4
+					&& space(AS_PROGRAM).read_dword(phys - 4) == 0x8c890010)
+				{
+					static int n;
+					if (n++ < 6)
+						logerror("resize w %08X\n", state_int(9));
+				}
+				if (op == 0xa10995e0 || op == 0xa10995e1)
+					return;
+				if (op == 0x12680012 && phys >= 4 && phys < 0x02000000
+					&& space(AS_PROGRAM).read_dword(phys - 4) == 0x2408013f)
+				{
+					static int noted;
+					if (noted < 2)
+					{
+						noted++;
+						logerror("ignored shutdown event at %08X\n", m_pc);
+					}
+					return;
+				}
+				if (op == 0x0020f809 && phys >= 8 && phys + 4 < 0x02000000
+					&& space(AS_PROGRAM).read_dword(phys - 8) == 0x24050144
+					&& space(AS_PROGRAM).read_dword(phys + 4) == 0x24060064)
+					return;
+			}
 			// check for interrupts
 			if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
 			{
@@ -661,6 +694,32 @@ void mips1core_device_base::execute_run()
 				else
 					take_branch(s32(m_r[RSREG]) > 0, true, false, op);
 				break;
+			case 0x1c: // R3900 multiply-accumulate. lib_coord sums squares with MAD.
+				switch (op & 63)
+				{
+				case 0x00: // MAD
+				case 0x01: // MADU
+					{
+						u64 const acc = (u64(m_hi) << 32 | m_lo) + ((op & 1)
+								? mulu_32x32(m_r[RSREG], m_r[RTREG])
+								: mul_32x32(m_r[RSREG], m_r[RTREG]));
+						m_lo = u32(acc);
+						m_hi = u32(acc >> 32);
+						if (RDREG)
+							m_r[RDREG] = m_lo;
+						m_icount -= 11;
+					}
+					break;
+				case 0x02: // MUL. Low half only; HI and LO are left alone.
+					if (RDREG)
+						m_r[RDREG] = u32(mul_32x32(m_r[RSREG], m_r[RTREG]));
+					m_icount -= 11;
+					break;
+				default:
+					generate_exception(EXCEPTION_INVALIDOP);
+					break;
+				}
+				break;
 			case 0x08: // ADDI
 				{
 					u32 const sum = m_r[RSREG] + SIMMVAL;
@@ -896,7 +955,40 @@ void mips1core_device_base::generate_exception(u32 exception, bool refill)
 		m_exc_log++;
 		logerror("exception %02x epc %08x (%s)\n", exception >> 2, m_pc, machine().describe_context());
 	}
-
+	// Paths the guest hands to the kernel. a0 (or a1) is the name.
+	if (exception == EXCEPTION_SYSCALL && m_pc < 0xbfc00000)
+	{
+		auto show = [this](u32 ptr) -> bool
+		{
+			// kseg0/kseg1, or a kuseg pointer in the low DRAM alias.
+			u32 phys = ptr;
+			if ((ptr >> 29) == 4 || (ptr >> 29) == 5)
+				phys = ptr & 0x1fffffff;
+			else if (ptr >= 0x02000000)
+				return false;
+			if (phys >= 0x02000000)
+				return false;
+			char text[81] = { };
+			bool slash = false;
+			for (int i = 0; i < 80; i++)
+			{
+				u8 const c = space(AS_PROGRAM).read_byte(phys + i);
+				if (c == 0)
+					break;
+				if (c < 32 || c > 126)
+					return false;
+				slash = slash || c == '/' || c == '.';
+				text[i] = char(c);
+			}
+			if (!slash || text[1] == 0)
+				return false;
+			logerror("svc %s\n", text);
+			return true;
+		};
+		static int paths;
+		if (paths < 400 && (show(m_r[4]) || show(m_r[5])))
+			paths++;
+	}
 	// a load-linked is void once any exception is taken
 	m_ll_active = false;
 

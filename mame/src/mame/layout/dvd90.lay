@@ -1,0 +1,150 @@
+<?xml version="1.0"?>
+<!--
+license:CC0-1.0
+-->
+<mamelayout version="2">
+	<!-- Opel DVD90 faceplate, arranged as in the owner's manual drawing.
+	     The screen sits above the fascia. Callouts from that drawing:
+	     1 volume/power knob, 2 audio eject, 4 NAVI, 5 MAIN, 6 center knob,
+	     7 INFO, 8 SOUND, 9 numeric pad, 10 phone, 11 BC, 12 SETTINGS,
+	     14 four-way pad, 15 TP, 16 AUDIO, 17 disc slots, 18 navi eject. -->
+	<element name="unit"><rect><color red="0.55" green="0.55" blue="0.57" /></rect></element>
+	<element name="bezel"><rect><color red="0.10" green="0.10" blue="0.11" /></rect></element>
+	<element name="slot"><rect><color red="0.16" green="0.16" blue="0.17" /></rect></element>
+	<element name="key" defstate="0">
+		<rect state="0"><color red="0.28" green="0.28" blue="0.30" /></rect>
+		<rect state="1"><color red="0.86" green="0.62" blue="0.16" /></rect>
+	</element>
+	<element name="knob" defstate="0">
+		<rect state="0"><color red="0.14" green="0.14" blue="0.15" /></rect>
+		<rect state="1"><color red="0.45" green="0.45" blue="0.48" /></rect>
+	</element>
+	<element name="t_title"><text string="DVD 90 NAVI"><color red="0.12" green="0.12" blue="0.13" /></text></element>
+	<element name="t_navi"><text string="NAVI"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_main"><text string="MAIN"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_info"><text string="INFO"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_sound"><text string="SOUND"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_audio"><text string="AUDIO"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_bc"><text string="BC"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_set"><text string="SETTINGS"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_tp"><text string="TP"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_ej"><text string="^"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_oi"><text string="OI"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_minus"><text string="-"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_plus"><text string="+"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_push"><text string="PUSH"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_left"><text string="&lt;"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_right"><text string="&gt;"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_up"><text string="^"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_down"><text string="v"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_1"><text string="1"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_2"><text string="2"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_3"><text string="3"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_4"><text string="4"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_5"><text string="5"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_6"><text string="6"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_7"><text string="7"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_8"><text string="8"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_9"><text string="9"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_0"><text string="0"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_lock"><text string="LOCK"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+	<element name="t_phone"><text string="TEL"><color red="0.95" green="0.95" blue="0.95" /></text></element>
+
+	<group name="fascia">
+		<bounds x="0" y="0" width="800" height="340" />
+		<element ref="t_title"><bounds x="8" y="4" width="140" height="18" /></element>
+
+		<!-- 1: volume / power, left side -->
+		<element ref="knob" inputtag="PANEL" inputmask="0x1000"><bounds x="12" y="78" width="22" height="64" /></element>
+		<element ref="t_minus"><bounds x="12" y="100" width="22" height="20" /></element>
+		<element ref="knob" inputtag="PANEL" inputmask="0x0400"><bounds x="34" y="70" width="28" height="80" /></element>
+		<element ref="t_oi"><bounds x="34" y="98" width="28" height="22" /></element>
+		<element ref="knob" inputtag="PANEL" inputmask="0x0800"><bounds x="62" y="78" width="22" height="64" /></element>
+		<element ref="t_plus"><bounds x="62" y="100" width="22" height="20" /></element>
+
+		<!-- 18 and 2: the two eject keys, one per disc slot -->
+		<element ref="key" inputtag="PANEL" inputmask="0x0100"><bounds x="100" y="28" width="36" height="26" /></element>
+		<element ref="t_ej"><bounds x="100" y="32" width="36" height="16" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0200"><bounds x="100" y="268" width="36" height="26" /></element>
+		<element ref="t_ej"><bounds x="100" y="272" width="36" height="16" /></element>
+
+		<!-- 17: the two disc slots -->
+		<element ref="slot"><bounds x="148" y="36" width="470" height="10" /></element>
+		<element ref="slot"><bounds x="148" y="176" width="470" height="10" /></element>
+
+		<!-- top row: 4 NAVI, 5 MAIN, 7 INFO, 8 SOUND -->
+		<element ref="key" inputtag="PANEL" inputmask="0x0001"><bounds x="148" y="58" width="84" height="40" /></element>
+		<element ref="t_navi"><bounds x="148" y="68" width="84" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0002"><bounds x="240" y="58" width="84" height="40" /></element>
+		<element ref="t_main"><bounds x="240" y="68" width="84" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0004"><bounds x="472" y="58" width="78" height="40" /></element>
+		<element ref="t_info"><bounds x="472" y="68" width="78" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0008"><bounds x="556" y="58" width="78" height="40" /></element>
+		<element ref="t_sound"><bounds x="556" y="68" width="78" height="20" /></element>
+
+		<!-- 6: center rotary, turn and push -->
+		<element ref="knob" inputtag="PANEL" inputmask="0x4000"><bounds x="336" y="78" width="28" height="70" /></element>
+		<element ref="t_left"><bounds x="336" y="100" width="28" height="22" /></element>
+		<element ref="knob" inputtag="PANEL" inputmask="0x2000"><bounds x="364" y="62" width="72" height="102" /></element>
+		<element ref="t_push"><bounds x="364" y="100" width="72" height="22" /></element>
+		<element ref="knob" inputtag="PANEL" inputmask="0x8000"><bounds x="436" y="78" width="28" height="70" /></element>
+		<element ref="t_right"><bounds x="436" y="100" width="28" height="22" /></element>
+
+		<!-- bottom row: 16 AUDIO, 15 TP, 12 SETTINGS, 11 BC -->
+		<element ref="key" inputtag="PANEL" inputmask="0x0010"><bounds x="148" y="200" width="84" height="40" /></element>
+		<element ref="t_audio"><bounds x="148" y="210" width="84" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0080"><bounds x="240" y="200" width="84" height="40" /></element>
+		<element ref="t_tp"><bounds x="240" y="210" width="84" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0040"><bounds x="472" y="200" width="78" height="40" /></element>
+		<element ref="t_set"><bounds x="472" y="210" width="78" height="20" /></element>
+		<element ref="key" inputtag="PANEL" inputmask="0x0020"><bounds x="556" y="200" width="78" height="40" /></element>
+		<element ref="t_bc"><bounds x="556" y="210" width="78" height="20" /></element>
+
+		<!-- 14: four-way pad, under the center knob -->
+		<element ref="key" inputtag="PAD" inputmask="0x0001"><bounds x="378" y="196" width="44" height="30" /></element>
+		<element ref="t_up"><bounds x="378" y="200" width="44" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0004"><bounds x="332" y="230" width="44" height="30" /></element>
+		<element ref="t_left"><bounds x="332" y="234" width="44" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0008"><bounds x="424" y="230" width="44" height="30" /></element>
+		<element ref="t_right"><bounds x="424" y="234" width="44" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0002"><bounds x="378" y="264" width="44" height="30" /></element>
+		<element ref="t_down"><bounds x="378" y="268" width="44" height="18" /></element>
+
+		<!-- 9 and 10: numeric pad, lock, zero, phone -->
+		<element ref="key" inputtag="PAD" inputmask="0x0010"><bounds x="640" y="28" width="48" height="36" /></element>
+		<element ref="t_1"><bounds x="640" y="36" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0020"><bounds x="692" y="28" width="48" height="36" /></element>
+		<element ref="t_2"><bounds x="692" y="36" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0040"><bounds x="744" y="28" width="48" height="36" /></element>
+		<element ref="t_3"><bounds x="744" y="36" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0080"><bounds x="640" y="68" width="48" height="36" /></element>
+		<element ref="t_4"><bounds x="640" y="76" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0100"><bounds x="692" y="68" width="48" height="36" /></element>
+		<element ref="t_5"><bounds x="692" y="76" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0200"><bounds x="744" y="68" width="48" height="36" /></element>
+		<element ref="t_6"><bounds x="744" y="76" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0400"><bounds x="640" y="108" width="48" height="36" /></element>
+		<element ref="t_7"><bounds x="640" y="116" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x0800"><bounds x="692" y="108" width="48" height="36" /></element>
+		<element ref="t_8"><bounds x="692" y="116" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x1000"><bounds x="744" y="108" width="48" height="36" /></element>
+		<element ref="t_9"><bounds x="744" y="116" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x4000"><bounds x="640" y="148" width="48" height="36" /></element>
+		<element ref="t_lock"><bounds x="640" y="156" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x2000"><bounds x="692" y="148" width="48" height="36" /></element>
+		<element ref="t_0"><bounds x="692" y="156" width="48" height="18" /></element>
+		<element ref="key" inputtag="PAD" inputmask="0x8000"><bounds x="744" y="148" width="48" height="36" /></element>
+		<element ref="t_phone"><bounds x="744" y="156" width="48" height="18" /></element>
+	</group>
+
+	<view name="DVD90">
+		<element ref="unit"><bounds x="0" y="0" width="840" height="860" /></element>
+		<element ref="bezel"><bounds x="12" y="8" width="816" height="484" /></element>
+		<screen tag="screen"><bounds x="20" y="16" width="800" height="468" /></screen>
+		<group ref="fascia"><bounds x="20" y="504" width="800" height="340" /></group>
+	</view>
+
+	<view name="Screen">
+		<screen tag="screen"><bounds x="0" y="0" width="800" height="468" /></screen>
+	</view>
+</mamelayout>

@@ -42,9 +42,12 @@ def main():
         "-skip_gameinfo", "-video", "none", "-sound", "none",
         "-nothrottle", "-log", "-seconds_to_run", seconds,
     ]
+    # Opened by the driver on the first READ, not by MAME at startup. The
+    # image device parses the whole 4 GB file up front and that misses the
+    # wall clock while the NAND image is still being copied.
     iso = ROOT / "cd" / "NAV_DB_21709.iso"
     if iso.exists():
-        cmd += ["-cdrom", str(iso)]
+        env["OPEL_CDROM"] = str(iso)
     cmd += extra
     with open(LOG / "mame.log", "w") as out:
         proc = subprocess.Popen(cmd, cwd=LOG, env=env, stdout=out, stderr=subprocess.STDOUT)
