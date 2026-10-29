@@ -426,13 +426,6 @@ void mips1core_device_base::execute_run()
 			if (machine().system().name && !strcmp(machine().system().name, "opel_dvd90"))
 			{
 				offs_t const phys = m_pc & 0x1fffffff;
-				if (op == 0xad09000c && phys >= 4
-					&& space(AS_PROGRAM).read_dword(phys - 4) == 0x8c890010)
-				{
-					static int n;
-					if (n++ < 6)
-						logerror("resize w %08X\n", state_int(9));
-				}
 				if (op == 0xa10995e0 || op == 0xa10995e1)
 					return;
 				if (op == 0x12680012 && phys >= 4 && phys < 0x02000000

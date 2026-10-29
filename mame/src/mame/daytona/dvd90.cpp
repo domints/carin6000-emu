@@ -80,10 +80,10 @@ namespace {
 constexpr uint32_t NAND_PAGE = 512;
 constexpr uint32_t NAND_SPARE = 16;
 constexpr uint32_t NAND_RAW_PAGE = NAND_PAGE + NAND_SPARE;
-constexpr uint32_t NAND_PAGES = 64 * 1024 * 1024 / NAND_PAGE; // 64 MB, 4 address cycles
+constexpr uint32_t NAND_PAGES = 32 * 1024 * 1024 / NAND_PAGE; // 32 MB (256 Mbit), 4 address cycles
 constexpr uint32_t NAND_PAGES_PER_BLOCK = 32;
 constexpr uint8_t NAND_MAKER = 0xec;  // Samsung
-constexpr uint8_t NAND_DEVICE = 0x76; // K9F1208, 64 MB
+constexpr uint8_t NAND_DEVICE = 0x75; // K9F5608U0C, 32 MB
 
 constexpr offs_t NAND_BASE = 0xfffe6000;
 constexpr offs_t DMA_BASE = 0xfffeb000;

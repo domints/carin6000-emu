@@ -3,9 +3,9 @@
 
   tools/opel_nand.py [--hw 0104] [--out state/opel_dvd90/nand.bin]
 
-The image is a 64 MB SmartMedia (SSFDC) card as the RoadRunner NAND
-controller sees it: 4096 blocks of 32 pages, each page 512 data bytes plus a
-16-byte spare area. Block 0 holds the CIS; the other blocks carry logical
+The image is a 32 MB NAND flash (Samsung K9F5608U0C, 256 Mbit) as the
+RoadRunner NAND controller sees it: 2048 blocks of 32 pages, each page 512
+data bytes plus a 16-byte spare area. Block 0 holds the CIS; the other blocks carry logical
 block numbers in their spare areas. On top sits a partition table and a FAT12
 volume with the files lowboot looks for:
 
@@ -33,11 +33,11 @@ FIRMWARE = ROOT / "cd" / "Radio-Update-Software-10-10-2007" / "V_3" / "HVM0"
 PAGE = 512
 SPARE = 16
 PAGES_PER_BLOCK = 32
-BLOCKS = 4096
+BLOCKS = 2048
 ZONE_BLOCKS = 1024
 ZONE_LOGICAL = 1000
 LOGICAL_BLOCKS = ZONE_LOGICAL * (BLOCKS // ZONE_BLOCKS)
-SECTORS = LOGICAL_BLOCKS * PAGES_PER_BLOCK          # 128000
+SECTORS = LOGICAL_BLOCKS * PAGES_PER_BLOCK          # 64000
 
 # Partition and FAT12 geometry. The data area starts on an erase-block
 # boundary: 39 hidden + 1 reserved + 2 x 12 FAT + 32 root = 96 sectors.
@@ -320,10 +320,10 @@ def boot_tib():
         "Version=v1",
         "",
         "[LowBoot]",
-        "ApplSelected=nav",
+        "ApplSelected=swl",
         "ApplSelectedPrev=nav",
         "NavApplFile=/compunit/nav/code/navboot",
-        "SwlApplFile=/cd/V_3/HVM0/0104/EHU4C/loader.ini",
+        "SwlApplFile=/compunit/swl/code/loader.ini",
         "TestApplFile=/compunit/test/code/testboot",
         "EjectEnabled=0",
         "NoTbxBootConsoleT1=0",
@@ -379,11 +379,14 @@ def nvr_image():
     sector with a 55 AA signature, 512-byte sectors, two FATs, a non-zero root
     directory and a FAT of 1..127 sectors.
     """
-    # config_tool writes a 2928-byte file here. At one sector per cluster the
-    # old 8-sector partition had four data clusters, three of them free, so the
-    # allocation search wrapped forever instead of returning disk-full.
-    sectors = CLUSTER_BYTES // PAGE - 1
-    image = bytearray(CLUSTER_BYTES)
+    # fm_sm keeps one sector per FAT (the root follows FAT1 by the FAT count, not
+    # by sectors-per-FAT). One 512-byte FAT12 holds 339 data clusters. startup
+    # uses one, config_tool writes 2928 bytes and bsi_com creates
+    # /nvr/addressbook at 20000 bytes, so the old 8-sector image (4 clusters)
+    # was full and the search never came back.
+    clusters = 320
+    sectors = 4 + clusters
+    image = bytearray((1 + sectors) * PAGE)
     entry = bytearray(16)
     entry[0] = 0x80
     entry[4] = 0x01
@@ -451,6 +454,9 @@ def main():
                 "CODE": {"LOWBOOT": (src / "lowboot").read_bytes()},
                 "DATA": {"BOOT.TIB": boot_tib()},
             },
+            "SWL": {
+                "CODE": {"loader.ini": (src / "loader.ini").read_bytes()},
+            },
             "NAV": {
                 "USW_LOAD.CFG": load_cfg,
                 "CODE": {
@@ -472,7 +478,12 @@ def main():
                 "NVRIMGA": nvr_image(),
                 "NVRIMGB": nvr_image(),
             },
-            "DATA": {"COMPUNIT.TIB": compunit_tib()},
+            # Present means the previous shutdown was clean. The conditional
+            # checkdisk opens this and, finding it, skips the full scan.
+            "DATA": {
+                "COMPUNIT.TIB": compunit_tib(),
+                "CHKDSKOK": b"\n",
+            },
         },
     }
     volume = Fat12().image(tree)
