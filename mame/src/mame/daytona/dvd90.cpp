@@ -160,6 +160,8 @@ private:
 	uint8_t panel_code() const;
 	uint32_t unmapped_r(offs_t offset, uint32_t mem_mask);
 	void unmapped_w(offs_t offset, uint32_t data, uint32_t mem_mask);
+	uint32_t port_r(offs_t offset, uint32_t mem_mask);
+	void port_w(offs_t offset, uint32_t data, uint32_t mem_mask);
 	void heartbeat(int param);
 	std::string backtrace();
 
@@ -244,6 +246,8 @@ private:
 	uint32_t m_i2c_irq = 0;
 	uint8_t m_i2c_held = 0;
 	uint32_t m_unmapped_log = 0;
+	// port1 at 0xAB000042 and port2 at 0xAB000062, kept as bytes from 0x40.
+	uint8_t m_port[0x40] = { };
 	uint32_t m_nand_log = 0;
 	std::unordered_map<offs_t, uint32_t> m_regs;
 
@@ -285,6 +289,8 @@ void opel_dvd90_state::navcpu_map(address_map &map)
 	map(0x40000000, 0x41ffffff).ram().share("dram");
 	map(0x10000000, 0x10001fff).ram();
 	map(0x1fc00000, 0x1fc65fff).rom().region("boot", 0);
+	// kseg1 0xAB000040. Two debug ports and the button/eject sense latch.
+	map(0x0b000040, 0x0b00007f).rw(FUNC(opel_dvd90_state::port_r), FUNC(opel_dvd90_state::port_w));
 	// kseg2 is not translated by the TLB-less core, so these stay at 0xff......
 	map(0xff000000, 0xffffffff).rw(FUNC(opel_dvd90_state::asic_r), FUNC(opel_dvd90_state::asic_w));
 }
@@ -701,6 +707,47 @@ void opel_dvd90_state::unmapped_w(offs_t offset, uint32_t data, uint32_t mem_mas
 	{
 		m_unmapped_log++;
 		logerror("%s unmapped W %08X = %08X mask=%08X\n", machine().describe_context(), offset << 2, data, mem_mask);
+	}
+}
+
+// port1 at 0xAB000042, port2 at 0xAB000062. Every byte reads back what was
+// written: lowboot decides the block is fitted by echoing 0xFF/0x5A/0xA5
+// through port1+0x0C (0xAB00004E). Two status bytes are inputs rather than
+// latches. +0x14 bits 5 and 6 stay set so the polls at BFC09D00 and BFC09D78
+// see the port idle, and bit 0 stays clear so that reads as no received
+// byte. +0x18 bit 4 stays set for the transmit wait at BFC09C18. +0x18 bit 6
+// is the button (port2) or eject (port1) sense and stays clear.
+uint32_t opel_dvd90_state::port_r(offs_t offset, uint32_t mem_mask)
+{
+	uint32_t data = 0;
+	for (int lane = 0; lane < 4; lane++)
+	{
+		uint32_t const mask = 0xffu << ((3 - lane) * 8);
+		if ((mem_mask & mask) == 0)
+			continue;
+		unsigned const index = (offset << 2) + lane;
+		uint8_t value = m_port[index];
+		if (index == 0x16 || index == 0x36)
+			value |= 0x60;
+		else if (index == 0x1a || index == 0x3a)
+			value |= 0x10;
+		data |= uint32_t(value) << ((3 - lane) * 8);
+	}
+	return data;
+}
+
+void opel_dvd90_state::port_w(offs_t offset, uint32_t data, uint32_t mem_mask)
+{
+	for (int lane = 0; lane < 4; lane++)
+	{
+		uint32_t const mask = 0xffu << ((3 - lane) * 8);
+		if ((mem_mask & mask) == 0)
+			continue;
+		unsigned const index = (offset << 2) + lane;
+		// Status bytes are inputs. A write there does not clear the ready bits.
+		if (index == 0x16 || index == 0x36 || index == 0x1a || index == 0x3a)
+			continue;
+		m_port[index] = uint8_t((data & mask) >> ((3 - lane) * 8));
 	}
 }
 
@@ -1413,8 +1460,22 @@ void opel_dvd90_state::cd_packet()
 	case 0x1b:
 	case 0x1e:
 	case 0x2b:
+		// No data phase. Status 0x50 is "ready", which is what the medium poll wants.
+		m_cd_status = 0x50;
+		break;
 	case 0xfb:
 		m_cd_count = 16;
+		m_cd_status = 0x58;
+		break;
+	case 0xfc:
+		// dr_atapi sends FC 00 55 .. and reads 4 bytes. Byte 1 is the medium
+		// state: 0 means ready, 3 and 5 make the caller send the command again.
+		m_cd_count = 4;
+		m_cd_status = 0x58;
+		break;
+	case 0xad:
+		// 24-byte disc descriptor. The buffer is already cleared.
+		m_cd_count = 0x18;
 		m_cd_status = 0x58;
 		break;
 	case 0x03:
@@ -1614,6 +1675,7 @@ void opel_dvd90_state::machine_reset()
 	m_i2c_ctrl[1] = 0;
 	m_i2c_irq = 0;
 	m_i2c_held = 0;
+	std::fill(std::begin(m_port), std::end(m_port), 0);
 	m_nand_ctrl = 0;
 	m_nand_cmd = 0;
 	m_nand_addr_count = 0;

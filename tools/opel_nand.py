@@ -320,7 +320,7 @@ def boot_tib():
         "Version=v1",
         "",
         "[LowBoot]",
-        "ApplSelected=swl",
+        "ApplSelected=nav",
         "ApplSelectedPrev=nav",
         "NavApplFile=/compunit/nav/code/navboot",
         "SwlApplFile=/compunit/swl/code/loader.ini",
