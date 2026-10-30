@@ -1,3 +1,5 @@
+**/.DS_Store
+
 # Machine state (NV + flash) and MAME settings, see tools/carin.py
 /state/
 # Per-run logs and the build log
