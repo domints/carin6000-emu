@@ -4,7 +4,7 @@
 POI: city and country category lists -> trie (12) -> name entries and details (11) -> access
 segment; table 7 points -> their name entries. Checks every step (docs/format.md sections 7, 8).
 
-usage: check_search.py [carindb] [--country pl] [--cities N]   (default: temp/navdb/warszawa/carindb)
+usage: check_search.py [carindb] [--country pl] [--cities N]   (default: temp/navdb/poland/carindb, every country)
 """
 import argparse
 import struct
@@ -25,8 +25,8 @@ def w(d, o):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
-    p.add_argument("--country", help="ISO code (default: the first country)")
+    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/poland/carindb")
+    p.add_argument("--country", help="ISO code (default: every country)")
     p.add_argument("--cities", type=int, default=0, help="check only the first N cities (0 = all)")
     args = p.parse_args()
     f = open(args.carindb, "rb")
@@ -98,14 +98,14 @@ def main():
     print("countries:", ", ".join(name for _, _, name in countries))
     for b4, entry, _ in countries:
         rec = entry[3]
-        args.country = args.country or b4[rec + 46:rec + 48].decode()
-        if b4[rec + 46:rec + 48].decode() != args.country:
+        iso = b4[rec + 46:rec + 48].decode()
+        if args.country and iso != args.country:
             continue
         poi_list(b4, w(b4, rec + 24), w(b4, rec + 26))
         e_ptr, e_off, e_n = struct.unpack_from(">IHH", b4, rec)
         cities = []
         walk(e_ptr, e_off, e_n, "", cities)
-        print(f"country {args.country}: {len(cities)} city entries")
+        print(f"country {iso}: {len(cities)} city entries")
         for k, (g, entry, cname) in enumerate(cities):
             if args.cities and k >= args.cities:
                 break

@@ -20,14 +20,17 @@ def pmap(func, items, min_items=32):
     global _JOB
     items = list(items)
     _JOB = (func, items)
-    if WORKERS <= 1 or len(items) < min_items:
-        yield from map(_run, range(len(items)))
-        return
-    gc.collect()
-    gc.freeze()                 # gc in the workers does not touch (copy) the parent's objects
     try:
-        with multiprocessing.get_context("fork").Pool(WORKERS) as pool:
-            chunk = max(1, min(64, len(items) // (WORKERS * 4)))
-            yield from pool.imap(_run, range(len(items)), chunksize=chunk)
+        if WORKERS <= 1 or len(items) < min_items:
+            yield from map(_run, range(len(items)))
+            return
+        gc.collect()
+        gc.freeze()             # gc in the workers does not touch (copy) the parent's objects
+        try:
+            with multiprocessing.get_context("fork").Pool(WORKERS) as pool:
+                chunk = max(1, min(64, len(items) // (WORKERS * 4)))
+                yield from pool.imap(_run, range(len(items)), chunksize=chunk)
+        finally:
+            gc.unfreeze()
     finally:
-        gc.unfreeze()
+        _JOB = None             # the job's data is not kept alive

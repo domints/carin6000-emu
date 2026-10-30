@@ -33,7 +33,7 @@ public class ExportOS9Modules extends GhidraScript {
         
         println("[*] Processing OS-9 Module: " + progName);
 
-        // 1. Obsługa nagłówka OS-9 (0x4AFC)
+        // 1. The OS-9 module header (0x4AFC)
         int syncBytes = getShort(toAddr(0x00)) & 0xFFFF;
         
         if (syncBytes == 0x4AFC) {
@@ -45,13 +45,13 @@ public class ExportOS9Modules extends GhidraScript {
             String modRealName = progName;
 
             try {
-                // Bezpieczne odczytanie nazwy modułu z bajtów ASCII
+                // Read the module name from its ASCII bytes, safely
                 StringBuilder nameBuilder = new StringBuilder();
                 Address currentNameAddr = toAddr(nameOffset);
                 for (int i = 0; i < 32; i++) {
                     byte b = getByte(currentNameAddr.add(i));
                     if (b == 0 || b == 0x0D || (b & 0xFF) > 127) {
-                        if ((b & 0x7F) >= 32) { // OS-9 czasem ustala ostatni bit nazwy na 1
+                        if ((b & 0x7F) >= 32) { // OS-9 sometimes sets bit 7 on the last character
                             nameBuilder.append((char)(b & 0x7F));
                         }
                         break;
@@ -69,7 +69,7 @@ public class ExportOS9Modules extends GhidraScript {
 
             println("    [+] Found OS-9 Header! Real Name: " + modRealName + " | Entry Offset: " + entryAddr);
 
-            // Wymuś utworzenie funkcji w prawdziwym punkcie wejścia, omijając nagłówek
+            // Force a function at the real entry point, past the header
             disassemble(entryAddr);
             createFunction(entryAddr, "os9_" + modRealName.replaceAll("[^a-zA-Z0-9_]", "_") + "_main");
         } else {
@@ -129,7 +129,7 @@ public class ExportOS9Modules extends GhidraScript {
             println("    [!] Could not add the Microware calling convention: " + e);
         }
 
-        // 2. Inicjalizacja dekompilatora
+        // 2. Set up the decompiler
         DecompInterface decomp = new DecompInterface();
         decomp.toggleCCode(true);
         decomp.toggleSyntaxTree(true);

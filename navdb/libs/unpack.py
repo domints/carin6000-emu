@@ -8,24 +8,9 @@ are rebuilt from an MSB-first bit stream, then the text area is decoded. Field m
 ../docs/format.md; this module only reproduces the layout pbp builds.
 """
 import struct
-import zlib
 
 BLOCK = 2048
 UNIT_HDR = 0x05     # record type of the unit header (8 bytes); the parcel header (type 0x11) follows
-
-
-def zlib_unit(unit, block=2048):
-    """A zlib-compressed unit (unit byte +6 == 2 on the newer discs, newer_disc_format.md §4):
-    8-byte unit header, then a zlib stream. Returns the image the device unpacks into RAM: the
-    header plus the decompressed payload, padded to (byte +7) blocks."""
-    try:
-        payload = zlib.decompress(unit[8:])
-    except zlib.error as e:
-        raise ValueError(f"broken zlib unit ({e})") from None
-    n = unit[7] * block
-    if not payload or len(payload) > n:
-        raise ValueError(f"broken zlib unit: payload {len(payload)} B, buffer {n} B")
-    return bytes(unit[:8]) + payload + bytes(n - len(payload))
 
 
 def bits_for(v):
@@ -63,11 +48,10 @@ def s16(v):
 
 
 class Unpacker:
-    def __init__(self, recsize, release, text_tables, block=BLOCK):
+    def __init__(self, recsize, release, text_tables):
         self.size = recsize          # record type -> size in bytes (block 0 table)
         self.release = release       # block 0 offset 0x1a (FUN_000034c0 returns it)
         self.text = text_tables      # (A, B, C, D) byte tables of the text decoder
-        self.block = block           # block size: newer discs read 512 from header 0x2c
 
     # -- helpers on the output buffer ---------------------------------------------------------
     def w(self, off):
@@ -91,18 +75,13 @@ class Unpacker:
 
     # -- entry ---------------------------------------------------------------------------------
     def unpack(self, unit):
-        """FUN_00003508. Returns the expanded unit (bytearray) or None for kinds not ported yet.
-        On the newer discs (unit byte +6 == 2, §4 of newer_disc_format.md) the unit header is
-        followed by a zlib stream; the device decompresses it into a buffer of (byte +7) blocks,
-        which is exactly the state the pbp expanders build, so the payload comes out directly."""
+        """FUN_00003508. Returns the expanded unit (bytearray) or None for kinds not ported yet."""
         self.src = unit
         length = unit[3]
-        if unit[6] == 2:
-            return bytearray(zlib_unit(unit, self.block))
         if not unit[6] & 1:
-            return bytearray(unit[:length * self.block])
-        self.dst = bytearray(unit[7] * self.block)
-        self.n = bits_for(unit[7] * self.block)    # FUN_000049f2
+            return bytearray(unit[:length * BLOCK])
+        self.dst = bytearray(unit[7] * BLOCK)
+        self.n = bits_for(unit[7] * BLOCK)            # FUN_000049f2
         self.cur = 0
         kind = struct.unpack_from(">H", unit, 4)[0]
         if kind == 0:
@@ -254,10 +233,7 @@ class Unpacker:
                 if b.read(1):
                     v = b.read(16)
                 else:
-                    # v = self.w(prev + 2): "same country number as the previous record". There is
-                    # no previous record for the first one; the C there reads zero-filled buffer
-                    # memory (seen on the newer disc, first flag 0 with release 34, slot 0).
-                    v = 0 if self.release < 0x15 or prev is None else self.w(prev + 2)
+                    v = 0 if self.release < 0x15 else self.w(prev + 2)
                 self.put_w(r + 2, v)
             prev = r
 
@@ -379,9 +355,7 @@ class Unpacker:
             self._xy(r, prev, r == off)
             self.put_w(r + 4, self.w(8 + 0x10) + self.size[0x08] * b.read(self.w53))
             struct.pack_into(">I", self.dst, r + p, b.read(32))
-            # back-offset of this point in the neighbour parcel. 14 bits on the reference discs
-            # (a unit is at most 8 x 2048 B); 16 bits on the newer ones, whose units are larger
-            self.put_w(r + p + 4, b.read(14 if self.block == BLOCK else 16))
+            self.put_w(r + p + 4, b.read(14))
             prev = r
 
     def points6(self, slot):

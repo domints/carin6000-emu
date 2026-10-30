@@ -49,10 +49,10 @@ def gps(lon, lat):
             round(lat / GPS_UNIT / POINT_STEP) * POINT_STEP)
 
 
-# Serbian Cyrillic -> Latin (Gaj), then folded like the rest; đ as "dj", as the original's
-# Croatian names ("djelo")
-CYRILLIC = dict(zip("абвгдђежзијклљмнњопрстћуфхцчџш",
-                    "a b v g d dj e z z i j k l lj m n nj o p r s t c u f h c c dz s".split()))
+# Serbian Cyrillic -> Latin (Gaj), Macedonian ѓ / ќ / ѕ as gj / kj / dz, then folded like the
+# rest; đ as "dj", as the original's Croatian names ("djelo")
+CYRILLIC = dict(zip("абвгдђежзијклљмнњопрстћуфхцчџшѓќѕѐѝ",
+                    "a b v g d dj e z z i j k l lj m n nj o p r s t c u f h c c dz s gj kj dz e i".split()))
 LATIN = {"đ": "dj", "Đ": "Dj", "ł": "l", "Ł": "L"}
 
 
@@ -102,11 +102,13 @@ class Road:
     figure: int = 0      # +17 low nibble: 6 roundabout, 3 restricted
     access: int = 2      # +17 high nibble: 2 normal, 4 destination only, 1 never
     paved: int = 1
+    toll: int = 0        # +11 bit 6: a toll / vignette road (the router adds a cost)
     osm_id: str = ""
     ref: str = None
     city: str = None
     muni: str = None
     settlement: str = None
+    country: str = None  # ISO code (libs/countries.py)
 
 
 @dataclass(slots=True)
@@ -116,6 +118,9 @@ class Edge:
     shape: list          # points between a and b
     road: Road
     length: int = 0      # metres
+    h0: int = None       # heading at a / at b (+14 / +15); None = from the points. Upper levels
+    h1: int = None       # take them from level 0, as the router matches levels by heading
+    marks: dict = None   # point -> metres from a, as the level 0 pieces add up (parcelbuild.clip)
 
     def points(self):
         return [self.a, *self.shape, self.b]
@@ -155,7 +160,8 @@ def road_attrs(highway, tags, name, detail="normal"):
     if not tags.get("ref") is None and fow == 12:
         fow = 11
     paved = 0 if tags.get("surface") in UNPAVED or highway == "track" else 1
-    return Road(fold(name), cls, fow, oneway, kind, figure, access, paved, ref=fold(tags.get("ref")))
+    toll = 1 if tags.get("toll") == "yes" or tags.get("toll:motorcar") == "yes" else 0
+    return Road(fold(name), cls, fow, oneway, kind, figure, access, paved, toll, ref=fold(tags.get("ref")))
 
 
 def _int(v, default=0):
@@ -180,11 +186,17 @@ def _linestring(blob):
 def load(gpkg, bbox, detail="normal"):
     """Network of the roads whose bounding box lies in bbox (lon0, lat0, lon1, lat1); gpkg = one
     GeoPackage or a list (rows deduplicated by OSM id)."""
-    from .osmsrc import rows as osm_rows
-    rows = osm_rows(gpkg,
+    from .osmsrc import prows
+    ways = prows(gpkg,
         "SELECT l.osm_id, l.name, l.highway, l.other_tags, l.geom FROM lines l "
         "JOIN rtree_lines_geom r ON l.fid = r.id WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? "
-        "AND r.miny <= ? AND l.highway IS NOT NULL", (bbox[0], bbox[2], bbox[1], bbox[3]))
+        "AND r.miny <= ? AND l.highway IS NOT NULL", (bbox[0], bbox[2], bbox[1], bbox[3]),
+        lambda rows: _ways(rows, bbox, detail))
+    return build(ways)
+
+
+def _ways(rows, bbox, detail):
+    """(road, points) of the road rows (in a worker)."""
     ways = []
     for osm_id, name, highway, other, geom in rows:
         tags = hstore(other)
@@ -204,7 +216,7 @@ def load(gpkg, bbox, detail="normal"):
                 pts.append(p)
         if len(pts) >= 2:
             ways.append((road, pts))
-    return build(ways)
+    return ways
 
 
 def build(ways):

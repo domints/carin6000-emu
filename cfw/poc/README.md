@@ -1,52 +1,52 @@
-# PoC: własny program z płyty (flash nietknięty)
+# PoC: a custom program from disc (flash untouched)
 
-Kopia płyty NAV_SW, w której `sysgo` zamiast UI instalatora (`ui_handler`) uruchamia nasz program. Sam instalator `il`, jedyny moduł, który programuje flash, jest zastąpiony zaślepką, która tylko śpi (`src/il_stub.S`), więc flash nie może zostać ruszony, nawet jeśli urządzenie wejdzie w pętlę ładowania. Podmiana jest we wszystkich czterech `loader.ini` na płycie: oba warianty sprzętu (`Mk2IC/0109` i `Mk2IC/0209`), w każdym `RENAULT/` i `RENAULT/app_sw/`. Ta sama płyta działa więc na 0109 i 0209. Bootrom startuje z płyty jak przy aktualizacji. Program:
+A copy of the NAV_SW disc on which `sysgo` starts our program instead of the installer UI (`ui_handler`). The installer `il` itself, the only module that programs the flash, is replaced by a stub that only sleeps (`src/il_stub.S`), so the flash cannot be touched even if the unit gets into a loading loop. The replacement is made in all four `loader.ini` files on the disc: both hardware variants (`Mk2IC/0109` and `Mk2IC/0209`), each in `RENAULT/` and `RENAULT/app_sw/`. So the same disc works on 0109 and 0209. The bootrom starts from the disc as for an update. The program:
 
-- rysuje HELLO WORLD i licznik w framebufferze ustawionym przez `videodr`;
-- czyta przyciski z `/nav_bus` (ramki `3A 3B 48 kod` i `3A 3B 49 kroki`): VOL+ +1, VOL− −1, pokrętło ±kroki, wciśnięcie pokrętła zeruje, Last message liczy 700 cyfr π (spigot Rabinowitza–Wagona, cyfry pojawiają się na bieżąco; w tym czasie przyciski czekają w kolejce);
-- loguje wszystko na UART A (konsola OS-9);
-- na starcie mierzy, czy Doom ma szanse, i pokazuje wynik w pasku tytułu (oraz w logu): `RAM` wolna pamięć razem i `MAX` największy blok (mapa z `F$GBlkMp`, nic nie alokuje), `COPY` ms na skopiowanie ramki 320×200 z RAM do bufora ekranu, `DRAW` ms na teksturowane wypełnienie 320×200 kolumnami (pętla jak `R_DrawColumn`, w C). W emulatorze: `RAM 3699K MAX 2048K COPY 60 DRAW 392 MS`. Liczby z prawdziwego urządzenia pokażą, ile emulator się myli.
+- draws HELLO WORLD and a counter in the framebuffer set up by `videodr`;
+- reads the buttons from `/nav_bus` (frames `3A 3B 48 code` and `3A 3B 49 steps`): VOL+ +1, VOL− −1, knob ±steps, knob push resets, Last message computes 700 digits of π (Rabinowitz–Wagon spigot, the digits appear as they are computed; the buttons wait in the queue meanwhile);
+- logs everything to UART A (the OS-9 console);
+- at start, measures whether Doom stands a chance and shows the result in the title bar (and in the log): `RAM` total free memory and `MAX` the largest block (map from `F$GBlkMp`, allocates nothing), `COPY` ms to copy a 320×200 frame from RAM to the screen buffer, `DRAW` ms for a textured 320×200 fill in columns (a loop like `R_DrawColumn`, in C). In the emulator: `RAM 3699K MAX 2048K COPY 60 DRAW 392 MS`. The numbers from a real unit will show how far off the emulator is.
 
-## Budowanie
+## Building
 
-Wymaga `m68k-elf-gcc` i `cd/carin_nav_sw.img`.
+Needs `m68k-elf-gcc` and `cd/carin_nav_sw.img`.
 
 ```bash
-make -C cfw/poc      # cfw/poc/build/ui_handler.mod, cfw/poc/build/il.mod (zaślepka), cd/carin_poc.img + .cue
-make -C cfw/poc chd  # dodatkowo cd/carin_poc.chd
+make -C cfw/poc      # cfw/poc/build/ui_handler.mod, cfw/poc/build/il.mod (stub), cd/carin_poc.img + .cue
+make -C cfw/poc chd  # also cd/carin_poc.chd
 ```
 
-Jak to działa:
+How it works:
 
-1. `src/start.S`: wejście procesu i opakowania wywołań systemowych (`trap #0`).
-2. `src/main.c`: program. Kod jest tylko PC-relative i nie ma zmiennych globalnych (moduł OS-9 jest tylko do odczytu), cały stan trzyma na stosie. Makefile odrzuca `.data`/`.bss` i relokacje absolutne.
-3. `src/il_stub.S`: zaślepka `il`, w kółko `F$Sleep`.
-4. `tools/mkmod.py`: binarka → moduł OS-9 (nagłówek, parzystość, CRC-24, pusty blok idata/irefs, bo F$Fork zawsze go przetwarza). Moduł ma dokładnie długość oryginału (`ui_handler` 31628 B, `il` 41004 B, w obu wariantach tyle samo), więc `loader.ini` zachowuje rozmiar i offsety.
-5. `tools/mkdisc.py`: szuka modułów po nazwie (nagłówek OS-9) we wszystkich `loader.ini` na płycie, podmienia je i przelicza EDC/ECC zmienionych sektorów (`tools/cdsector.py`, sprawdzone na oryginalnych sektorach). Gdy nie znajdzie dokładnie czterech kopii albo rozmiar się nie zgadza, przerywa.
+1. `src/start.S`: the process entry point and the system call wrappers (`trap #0`).
+2. `src/main.c`: the program. The code is PC-relative only and has no global variables (an OS-9 module is read-only); all state lives on the stack. The Makefile rejects `.data`/`.bss` and absolute relocations.
+3. `src/il_stub.S`: the `il` stub, `F$Sleep` in a loop.
+4. `tools/mkmod.py`: binary → OS-9 module (header, parity, CRC-24, an empty idata/irefs block, because F$Fork always processes it). The module has exactly the original's length (`ui_handler` 31628 B, `il` 41004 B, the same in both variants), so `loader.ini` keeps its size and offsets.
+5. `tools/mkdisc.py`: finds the modules by name (OS-9 header) in every `loader.ini` on the disc, replaces them and recomputes the EDC/ECC of the changed sectors (`tools/cdsector.py`, checked against original sectors). If it does not find exactly four copies or a size does not match, it stops.
 
-## Test w emulatorze
+## Testing in the emulator
 
 ```bash
 tools/carin.py gui --state poc --load state/installed --cd carin_poc          # 0209
 tools/carin.py gui --state poc0109 --load state/hw0109 --cd carin_poc         # 0109
-tools/carin.py gui --state poc_pusty --seed --hw 0109 --cd carin_poc          # pusty flash: od razu z płyty
+tools/carin.py gui --state poc_empty --seed --hw 0109 --cd carin_poc          # empty flash: straight from the disc
 ```
 
-`--load` kopiuje stan, więc oryginał zostaje nietknięty. Płyta PoC to kopia NAV_SW, więc działa jak aktualizacja: włóż ją do działającej nawigacji, zamknij „Attention!”, soft ustawi flagę sw-load i się zrestartuje, a bootrom załaduje PoC.
+`--load` copies the state, so the original stays untouched. The PoC disc is a copy of NAV_SW, so it works like an update: insert it into a running navigation unit, close "Attention!", the software sets the sw-load flag and restarts, and the bootrom loads the PoC.
 
-## Na prawdziwym sprzęcie
+## On real hardware
 
-Nagrywanie (obraz MODE2/2352, raw):
+Burning (MODE2/2352 image, raw):
 
 ```bash
 cd cd && cdrdao write --device /dev/sr0 carin_poc.cue
 ```
 
-Ryzyka:
+Risks:
 
-1. Nie wiemy, co w aucie każe bootromowi startować z płyty przy ważnym flashu. W emulatorze to linia z ekspandera I/O (zgadnięta). Najpierw sprawdź kopią oryginalnej NAV_SW, czy urządzenie w ogóle startuje z CD-R.
-2. `sysgo` z płyty startuje `il_slave` na slavie (tak jak przy normalnej aktualizacji). Bez poleceń od `il` (tu zaślepki) nie powinien niczego programować, ale tego jeszcze nie sprawdziliśmy w RE.
-3. Paleta jest nieznana, więc kolory mogą wyjść inne niż w emulatorze. Użyte są indeksy, którymi rysuje oryginalny soft (0x49 tło, 0xFF tekst, 0x92 akcent, 0x00).
-4. Czy moduł pośredni wysyła przyciski bez uzgadniania z MMI (które tu nie działa), wyjdzie dopiero w aucie.
+1. We do not know what makes the bootrom start from the disc in the car when the flash is valid. In the emulator it is a line from the I/O expander (a guess). First check with a copy of the original NAV_SW whether the unit boots from a CD-R at all.
+2. `sysgo` from the disc starts `il_slave` on the slave (as in a normal update). Without commands from `il` (a stub here) it should not program anything, but this has not been checked in RE yet.
+3. The palette is unknown, so the colours may differ from the emulator. The program uses the indexes the original software draws with (0x49 background, 0xFF text, 0x92 accent, 0x00).
+4. Whether the intermediate module sends the buttons without the handshake with MMI (which does not run here) will only show in the car.
 
-Jeśli program się nie uruchomi: wyjmij płytę i zrób reset (wyłącz zapłon), a urządzenie wystartuje z flasha.
+If the program does not start: take the disc out and reset (switch the ignition off), and the unit boots from flash.

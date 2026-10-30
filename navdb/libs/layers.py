@@ -29,26 +29,11 @@ Every function takes `progress`, an object with step(text, done, total) and fini
 """
 import struct
 
-from .carindb import (GPS_UNIT, HN_NONE, POINT_STEP, TEXT_TABLES, UnitCache, block_size, cstring,
-                      lat, lon, read_blocks, read_unit, units, x_units, y_units)
-from .spindex import Index
-from .unpack import Unpacker, zlib_unit
+from .carindb import (BLOCK, GPS_UNIT, HN_NONE, POINT_STEP, TEXT_TABLES, UnitCache, cstring, lat, lon,
+                      read_unit, units)
+from .unpack import Unpacker
 
 ROUTING_LEVELS = ((1, 0), (0x1E, 1), (3, 2), (2, 3))
-NO_TABLE = ((0, 0), (0, 0), (0, 0))
-
-
-def table_units(f, table, bbox):
-    """(block, length) of the data units of a table to decode. With a box and a spatial index part,
-    only the units under the box, found through the index like the device does (top cell -> leaf ->
-    subcell -> unit pointer); otherwise every unit of the table."""
-    (index, _), (data, _), (end, _) = table
-    if not data:
-        return []
-    if bbox and index:
-        return Index(f, index, data).pointers((x_units(bbox[0]), y_units(bbox[1]),
-                                               x_units(bbox[2]), y_units(bbox[3])))
-    return [(b, length) for b, length, _ in units(f, data, end)]
 
 
 def parcels(f, gp, tables, bbox, sizes, release, progress):
@@ -68,39 +53,31 @@ def parcels(f, gp, tables, bbox, sizes, release, progress):
                                      ("access", "INTEGER"), ("paved", "INTEGER"), ("access_code", "INTEGER"),
                                      ("no_turns", "INTEGER"), ("ferry_min", "INTEGER"),
                                      ("b10", "INTEGER"), ("b11", "INTEGER"), ("b16", "INTEGER"), ("b17", "INTEGER")])
-    unpacker = Unpacker(sizes, release, TEXT_TABLES, block_size(f))
+    unpacker = Unpacker(sizes, release, TEXT_TABLES)
     for tid, level in ROUTING_LEVELS:
-        parcel_level(f, gp, tables.get(tid, NO_TABLE), level, bbox, sizes, unpacker, progress)
+        parcel_level(f, gp, tables[tid], level, bbox, sizes, unpacker, progress)
 
 
 def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
     """One routing level: parcels and their segments. Word 0x58: the parcel of the level above
     (unit pointer, 0 at the top)."""
+    (_, _), (data, _), (end, _) = table
     n = roads = 0
-    todo = table_units(f, table, bbox)
-    for k, (b, length) in enumerate(todo):
-        progress.step(f"roads, level {level}", k, len(todo))
-        raw = read_blocks(f, b, length)
-        # raw and pbp units keep the 116-byte parcel header (never compressed) on disk: the box
-        # allows a cheap bbox pre-filter before unpacking; only zlib units (+6 == 2) need the
-        # unpacked image for it
-        if bbox and raw[6] != 2:
-            hx1, hy1, hx2, hy2 = struct.unpack_from(">4I", raw, 0x44)
-            if lon(hx2) < bbox[0] or lon(hx1) > bbox[2] or lat(hy2) < bbox[1] or lat(hy1) > bbox[3]:
-                continue
-        try:
-            d = unpacker.unpack(raw)
-        except (ValueError, struct.error, IndexError, KeyError):
-            continue                      # a unit that will not unpack: skip, like old ones did
-        if d is None:
-            continue
-        x1, y1, x2, y2 = struct.unpack_from(">4I", d, 0x44)   # the box of the *unpacked* unit:
-        box = (lon(x1), lat(y1), lon(x2), lat(y2))           # zlib units only have it there
+    if not data:
+        return
+    for b, length, head in units(f, data, end):
+        progress.step(f"roads, level {level}", b - data, end - data)
+        x1, y1, x2, y2 = struct.unpack_from(">4I", head, 0x44)
+        box = (lon(x1), lat(y1), lon(x2), lat(y2))
         if bbox and (box[2] < bbox[0] or box[0] > bbox[2] or box[3] < bbox[1] or box[1] > bbox[3]):
             continue
         ring = [(box[0], box[1]), (box[2], box[1]), (box[2], box[3]), (box[0], box[3])]
-        gp.add("parcels", ring, (level, b, length, raw[6], struct.unpack_from(">I", d, 0x58)[0] >> 8))
+        gp.add("parcels", ring, (level, b, length, head[6] & 1, struct.unpack_from(">I", head, 0x58)[0] >> 8))
         n += 1
+        f.seek(b * BLOCK)
+        d = unpacker.unpack(f.read(length * BLOCK))
+        if d is None:
+            continue
         w = lambda o: struct.unpack_from(">H", d, o)[0]
         sx = sy = POINT_STEP * GPS_UNIT
         text_start = w(8 + 0x38)
@@ -121,7 +98,6 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
         # dbq FUN_00001890: type 08 (32 bytes) in kind 0 units, type 09 (26 bytes, no name
         # reference at +26) in the routing levels
         rs = sizes[0x08] if w(4) == 0 else sizes[0x09]
-        seg_n = max(0, min(seg_n, (len(d) - seg_off) // rs))   # defensive: broken slot counts
         # per-segment house numbers (rpmod FUN_000151cc): word 0x54 of a level 0 parcel points to a
         # kind 4 unit outside the table directory (+12 = this parcel), 10-byte records from 0x10,
         # one per segment: left from, right from, left to, right to (sides for travel start ->
@@ -129,19 +105,10 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
         hn_unit, = struct.unpack_from(">I", d, 0x54) if level == 0 else (0,)
         if hn_unit:
             hu = read_unit(f, hn_unit)
-            try:
-                if hu[6] == 2:             # table a on the newer disc: zlib units
-                    hu = zlib_unit(hu, block_size(f))
-            except ValueError:
-                hu = b""
-            # +12 = the parcel it belongs to; anything else: a pointer into a gap / garbage
-            if len(hu) < 0x10 or struct.unpack_from(">I", hu, 12)[0] >> 8 != b:
-                hn_unit = 0
-        hn_n = (len(hu) - 0x10) // 10 if hn_unit else 0    # one 10 B record per segment
         for i in range(seg_n):
             r = seg_off + i * rs
             numbers = [None] * 5
-            if i < hn_n:
+            if hn_unit:
                 lf, rf, lt, rt, scheme = struct.unpack_from(">5H", hu, 0x10 + 10 * i)
                 numbers = [None if v == HN_NONE else v for v in (lf, lt, rf, rt)] + [scheme]
             a, c = w(r), w(r + 2)
@@ -150,9 +117,8 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
             # shape points between the end points (dbq FUN_000149ba): slot 7 records (type 0x0c,
             # x, y, flags) from this segment's +4 up to the next segment's +4
             s7_end = w(8 + 0x1C) + sizes[0x0C] * w(8 + 0x1E)
-            s7_end = min(s7_end, len(d) - sizes[0x0C] + 1)     # defensive: past the buffer end
             nxt = w(r + rs + 4) if i + 1 < seg_n else s7_end
-            shape = range(w(r + 4), min(nxt, s7_end), sizes[0x0C]) if w(r + 4) else ()
+            shape = range(w(r + 4), min(nxt or s7_end, s7_end), sizes[0x0C]) if w(r + 4) else ()
             pts = [(box[0] + w(o) * sx, box[1] + w(o + 2) * sy) for o in (a, *shape, c)]
             street, district, parent = place(w(r + 26)) if rs >= 28 else (None, None, 0)
             city_a, city_b, parent = place(parent)
@@ -163,7 +129,7 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
             turns_end = w(8 + 0x28) + sizes[0x14] * w(8 + 0x2A) if last else w(r + rs + 18)
             attrs_end = w(8 + 0x30) + sizes[0x15] * w(8 + 0x32) if last else w(r + rs + 20)
             ferry = None
-            for o in range(w(r + 20), min(attrs_end, len(d) - sizes[0x15] + 1), sizes[0x15]):
+            for o in range(w(r + 20), attrs_end, sizes[0x15]):
                 if w(o) == 5:
                     ferry = w(o + 2)
             gp.add("roads", pts, (level, b, i, street, district, city_a or city_b, country,
@@ -180,22 +146,22 @@ def parcel_level(f, gp, table, level, bbox, sizes, unpacker, progress):
 # POI categories (record +10), named from the names found under each code around Warsaw; codes
 # not seen there are left unnamed.
 POI_CATEGORIES = {
-    11: "dealer samochodowy", 12: "stacja paliw", 13: "wypożyczalnia samochodów", 14: "parking",
-    15: "park & ride", 20: "atrakcja turystyczna", 21: "hotel / nocleg", 22: "restauracja / kawiarnia",
-    23: "bank", 24: "dom kultury", 25: "biblioteka", 26: "sąd / prokuratura", 29: "ambasada",
-    30: "bankomat", 31: "informacja turystyczna", 32: "muzeum", 33: "teatr / sala koncertowa",
-    35: "obiekt sportowy", 36: "kościół", 37: "cmentarz", 38: "tor / karting", 39: "park / rezerwat",
-    40: "centrum wystawowe", 41: "szpital", 42: "policja", 43: "urząd", 44: "poczta",
-    45: "przychodnia", 46: "apteka", 47: "sklep / centrum handlowe", 48: "miejscowość",
-    49: "kino", 50: "pole golfowe", 51: "stacja kolejowa", 52: "lotnisko", 54: "dworzec autobusowy",
-    56: "szkoła / przedszkole", 57: "rozrywka / nocne życie", 59: "serwis samochodowy",
-    61: "firma / zakład",
+    11: "car dealer", 12: "fuel station", 13: "car rental", 14: "parking",
+    15: "park & ride", 20: "tourist attraction", 21: "hotel / accommodation", 22: "restaurant / cafe",
+    23: "bank", 24: "culture centre", 25: "library", 26: "court / prosecutor", 29: "embassy",
+    30: "ATM", 31: "tourist information", 32: "museum", 33: "theatre / concert hall",
+    35: "sports facility", 36: "church", 37: "cemetery", 38: "race track / karting", 39: "park / reserve",
+    40: "exhibition centre", 41: "hospital", 42: "police", 43: "town hall / office", 44: "post office",
+    45: "clinic", 46: "pharmacy", 47: "shop / shopping centre", 48: "locality",
+    49: "cinema", 50: "golf course", 51: "railway station", 52: "airport", 54: "bus station",
+    56: "school / kindergarten", 57: "entertainment / nightlife", 59: "car service",
+    61: "company / plant",
 }
 
 
-AREA_TYPES = {1: "woda", 3: "las / park", 5: "zabudowa", 6: "cmentarz", 8: "wyspa / ląd"}
-LINE_TYPES = {101: "rzeka / kanał", 102: "kolej", 103: "granica?", 104: "droga główna", 105: "droga krajowa",
-              106: "droga wojewódzka"}
+AREA_TYPES = {1: "water", 3: "forest / park", 5: "built-up", 6: "cemetery", 8: "island / land"}
+LINE_TYPES = {101: "river / canal", 102: "railway", 103: "border?", 104: "main road", 105: "national road",
+              106: "regional road"}
 BACKGROUND_LEVELS = ((6, 0), (0x16, 1), (0x15, 2), (0x1C, 3), (0x14, 4), (0x1D, 5))
 
 
@@ -208,24 +174,20 @@ def background(f, gp, tables, bbox, sizes, release, progress):
                                   ("name", "TEXT"), ("area_m2", "INTEGER"), ("block", "INTEGER")])
     gp.layer("overview_roads", "LINESTRING", [("level", "INTEGER"), ("type", "INTEGER"), ("type_name", "TEXT"),
                                               ("name", "TEXT"), ("length_m", "INTEGER"), ("block", "INTEGER")])
-    unpacker = Unpacker(sizes, release, TEXT_TABLES, block_size(f))
+    unpacker = Unpacker(sizes, release, TEXT_TABLES)
     for tid, level in BACKGROUND_LEVELS:
+        (_, _), (data, _), (end, _) = tables[tid]
         na = nr = 0
-        todo = table_units(f, tables.get(tid, NO_TABLE), bbox)
-        if not todo:
+        if not data:
             continue
-        for k, (b, length) in enumerate(todo):
-            progress.step(f"background, level {level}", k, len(todo))
-            try:
-                d = unpacker.unpack(read_blocks(f, b, length))
-            except (ValueError, struct.error, IndexError, KeyError):
-                continue                      # a unit that will not unpack: skip, like old ones did
-            if d is None:
-                continue
-            # the box of the unpacked unit: the 52-byte header is raw in pbp units, but inside the
-            # compressed payload of zlib units (+6 == 2)
-            x0, y0, x1, y1 = struct.unpack_from(">4i", d, 0x20)
+        for b, length, head in units(f, data, end):
+            progress.step(f"background, level {level}", b - data, end - data)
+            x0, y0, x1, y1 = struct.unpack_from(">4i", head, 0x20)     # the 52-byte header is never compressed
             if bbox and (lon(x1) < bbox[0] or lon(x0) > bbox[2] or lat(y1) < bbox[1] or lat(y0) > bbox[3]):
+                continue
+            f.seek(b * BLOCK)
+            d = unpacker.unpack(f.read(length * BLOCK))
+            if d is None:
                 continue
             w = lambda o: struct.unpack_from(">H", d, o)[0]
             wide = w(8 + 0x10 + sizes[0x3F]) == 0
@@ -234,9 +196,7 @@ def background(f, gp, tables, bbox, sizes, release, progress):
 
             def shape(r, rs):
                 pts = []
-                for p in range(w(r + 2), min(w(r + rs + 2), len(d)), step):
-                    if p + step > len(d):
-                        break
+                for p in range(w(r + 2), w(r + rs + 2), step):
                     if wide:
                         X, Y = struct.unpack_from(">ii", d, p)
                     else:
@@ -245,10 +205,8 @@ def background(f, gp, tables, bbox, sizes, release, progress):
                 return pts
 
             g_off, g_cnt = w(8), w(10)
-            g_cnt = max(0, min(g_cnt, (len(d) - g_off) // 4 - 1))
             groups = [(d[g_off + 4 * i], d[g_off + 4 * i + 1], w(g_off + 4 * i + 2)) for i in range(g_cnt + 1)]
             off, cnt, rs = w(12), w(14), sizes[0x3A]
-            cnt = max(0, min(cnt, (len(d) - off) // rs))
             for i in range(cnt):
                 r = off + i * rs
                 typ = None
@@ -261,7 +219,6 @@ def background(f, gp, tables, bbox, sizes, release, progress):
                                           struct.unpack_from(">I", d, r + 4)[0], b))
                     na += 1
             off, cnt, rs = w(16), w(18), sizes[0x3C]
-            cnt = max(0, min(cnt, (len(d) - off) // rs))
             for i in range(cnt):
                 r = off + i * rs
                 typ = None                  # slot 0 groups of kind 1 cover the lines
@@ -276,54 +233,31 @@ def background(f, gp, tables, bbox, sizes, release, progress):
         progress.finish(f"background, level {level} (table {tid:x}): {na} areas, {nr} roads")
 
 
-def unit_image(f, raw):
-    """A unit as stored, or decompressed when it is a zlib unit (+6 == 2: tables 7, 11 and d on the
-    newer discs). Byte +6 is cleared in the result, which is what pbp does after unpacking, so a
-    second call leaves the image alone. The parcel unpacker wants the raw bytes instead, so this
-    is not read_unit()."""
-    if len(raw) >= 8 and raw[6] == 2:
-        d = bytearray(zlib_unit(raw, block_size(f)))
-        d[6] = 0
-        return bytes(d)
-    return raw
-
-
 def poi(f, gp, tables, bbox, progress):
     """Table 7: points of interest."""
     gp.layer("poi", "POINT", [("name", "TEXT"), ("brand", "TEXT"), ("category", "INTEGER"),
                               ("category_name", "TEXT"), ("street", "TEXT"), ("housenumber", "TEXT"),
                               ("district", "TEXT"), ("city", "TEXT"), ("postcode", "TEXT"), ("phone", "TEXT"),
                               ("block", "INTEGER"), ("field16", "INTEGER")])
-    refs = UnitCache(f)
+    refs = UnitCache(open(f.name, "rb"))
+    (_, _), (data, _), (end, _) = tables[7]
     n = 0
-    todo = table_units(f, tables.get(7, NO_TABLE), bbox)
-    if not todo:
+    if not data:
         return progress.finish("poi: table empty")
-    for k, (b, length) in enumerate(todo):
-        progress.step("poi", k, len(todo))
-        try:
-            u = unit_image(f, read_blocks(f, b, length))
-        except ValueError:
-            continue
+    for b, length, head in units(f, data, end):
+        progress.step("poi", b - data, end - data)
+        f.seek(b * BLOCK)
+        u = f.read(length * BLOCK)
         off, count = struct.unpack_from(">HH", u, 8)
         x0, y0, x1, y1 = struct.unpack_from(">4I", u, 0x10)
         if bbox and (lon(x1) < bbox[0] or lon(x0) > bbox[2] or lat(y1) < bbox[1] or lat(y0) > bbox[3]):
             continue
-        count = max(0, min(count, (len(u) - off) // 28))   # defensive: broken slot counts
         for i in range(count):
             r = off + i * 28
-            if r + 28 > len(u):
-                break
             ptr, noff, x, y, cat, brand = struct.unpack_from(">IHHHHH", u, r)
             name, details = None, [None] * 6
             if ptr:
                 t = refs.get(ptr)
-                if len(t) >= 8 and t[6] == 2:       # table 11 is zlib on the newer discs
-                    try:
-                        t = unit_image(f, t)
-                    except ValueError:
-                        t = b""
-                    refs.cache[ptr] = t
                 if noff + 8 <= len(t):
                     # table 11 name entry: name, flags, district, offset of the 40-byte detail record
                     nm, _, district, rec = struct.unpack_from(">HHHH", t, noff)
@@ -345,23 +279,18 @@ def cities(f, gp, tables, bbox, sizes, release, progress):
     the others go to alt_names)."""
     gp.layer("cities", "POINT", [("name", "TEXT"), ("municipality", "TEXT"), ("lang", "INTEGER"),
                                  ("alt_names", "TEXT"), ("trie_roots", "INTEGER"), ("block", "INTEGER")])
-    unpacker = Unpacker(sizes, release, TEXT_TABLES, block_size(f))
-    (_, _), (data, _), (end, _) = tables.get(0x0D, ((0, 0), (0, 0), (0, 0)))
+    unpacker = Unpacker(sizes, release, TEXT_TABLES)
+    (_, _), (data, _), (end, _) = tables[0x0D]
     if not data:
         return progress.finish("cities: table empty")
     found = {}          # (unit block, record offset) -> [name, municipality, lang, alt names, parcel, segment, roots]
     for b, length, head in units(f, data, end):
         progress.step("cities (names)", b - data, end - data)
-        try:
-            u = unit_image(f, read_blocks(f, b, length))
-        except ValueError:
-            continue
+        f.seek(b * BLOCK)
+        u = f.read(length * BLOCK)
         off, count = struct.unpack_from(">HH", u, 8)
-        count = max(0, min(count, (len(u) - off) // 8))       # defensive: broken slot counts
         for i in range(count):
             name, flags, muni, rec = struct.unpack_from(">HHHH", u, off + 8 * i)
-            if rec + 14 > len(u):          # defensive: a name entry pointing outside its unit
-                continue
             c = found.setdefault((b, rec), [None, None, None, [], *struct.unpack_from(">IH", u, rec + 12),
                                             struct.unpack_from(">H", u, rec + 6)[0]])
             if flags >> 8 == 0 and c[0] is None:
@@ -377,14 +306,10 @@ def cities(f, gp, tables, bbox, sizes, release, progress):
         if not ptr:                 # a few cities have no segment
             continue
         raw = read_unit(f, ptr)
-        bx0, by0, bx1, by1 = struct.unpack_from(">4I", raw, 0x44)    # raw in pbp units, not in zlib ones
-        if bbox and raw[6] != 2 and (lon(bx1) < bbox[0] or lon(bx0) > bbox[2]
-                                     or lat(by1) < bbox[1] or lat(by0) > bbox[3]):
+        bx0, by0, bx1, by1 = struct.unpack_from(">4I", raw, 0x44)    # header is never compressed
+        if bbox and (lon(bx1) < bbox[0] or lon(bx0) > bbox[2] or lat(by1) < bbox[1] or lat(by0) > bbox[3]):
             continue
-        try:
-            d = unpacker.unpack(raw)
-        except (ValueError, struct.error, IndexError, KeyError):
-            continue
+        d = unpacker.unpack(raw)
         if d is None:
             continue
         x0, y0 = struct.unpack_from(">II", d, 0x44)

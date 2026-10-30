@@ -1,91 +1,91 @@
-# Wejście: moduł pośredni na `nav_bus` (stan RE)
+# Input: the intermediate module on `nav_bus` (RE status)
 
-Notatki z inżynierii wstecznej, stan na 2026-10-21. Przyciski z deski/kierownicy i dane z radia zbiera moduł pośredni (to nie jest slave C166). Do nawigacji wysyła je po I2C, bez linii MRQ.
+Reverse engineering notes, as of 2026-10-21. The buttons from the dashboard / steering wheel and the data from the radio are collected by an intermediate module (this is not the C166 slave). It sends them to the navigation unit over I2C, without the MRQ line.
 
-## Warstwa fizyczna (potwierdzone)
+## Physical layer (confirmed)
 
-- Urządzenie OS-9 `/nav_bus` (sterownik `vbnavi2c`, menedżer `vbf`) na kontrolerze I2C w MCASIC (`vbi2csp2`, 0xC00020).
-- Moduł ma adres I2C 0x50 (zapis), 0x51 (odczyt).
-- Linia „uwagi” modułu to IRQ poziomu 4 (autowektor 28), bramkowana bitem 2 w 0xC0001C. Po jej zgłoszeniu `vbnavi2c` czyta 1 bajt statusu z 0x51.
-- Status: połówka bajtu na slot (slot 0 w górnej). Bit 0 = „ramkę odebrałem”, bit 1 = „mam ramkę dla nawigacji”.
-- Pobranie ramki ze slotu 1: zapis `01 01` do 0x50, potem odczyt 0x50 bajtów z 0x51 (potwierdzone eksperymentem: status 0x13 wywołał dokładnie to).
-- Sloty z deskryptora `nav_bus`: slot 0 (flagi 0, adres 0x00), slot 1 (flagi 0x02, adres 0x50/0x01, prefiks 2 bajty), oba po 0x50 bajtów.
+- The OS-9 device `/nav_bus` (driver `vbnavi2c`, manager `vbf`) on the I2C controller in the MCASIC (`vbi2csp2`, 0xC00020).
+- The module's I2C address is 0x50 (write), 0x51 (read).
+- The module's "attention" line is a level 4 IRQ (autovector 28), gated by bit 2 in 0xC0001C. When it is raised, `vbnavi2c` reads 1 status byte from 0x51.
+- Status: one nibble per slot (slot 0 in the high nibble). Bit 0 = "I received the frame", bit 1 = "I have a frame for the navigation".
+- Fetching a frame from slot 1: write `01 01` to 0x50, then read 0x50 bytes from 0x51 (confirmed by experiment: status 0x13 triggered exactly this).
+- Slots from the `nav_bus` descriptor: slot 0 (flags 0, address 0x00), slot 1 (flags 0x02, address 0x50/0x01, 2-byte prefix), both 0x50 bytes.
 
-## Ramki nawigacja → moduł (widziane na magistrali)
+## Frames navigation → module (seen on the bus)
 
-| Ramka | Znaczenie (hipoteza) |
+| Frame | Meaning (hypothesis) |
 |---|---|
-| `01 08 00` | inicjalizacja `vbnavi2c` |
-| `00 1C 07 8F 04 03 01 00 89` | slot 0, ID 0x1C, długość 7 (stan wejść od `recv_ibus`) |
-| `00 3B 06 3A 00 01 01 01` | slot 0, adres modułu 0x3B, długość 6, funkcja 0x3A (NAOK) |
+| `01 08 00` | `vbnavi2c` initialisation |
+| `00 1C 07 8F 04 03 01 00 89` | slot 0, ID 0x1C, length 7 (input state from `recv_ibus`) |
+| `00 3B 06 3A 00 01 01 01` | slot 0, module address 0x3B, length 6, function 0x3A (NAOK) |
 
-## Słownik komend (`send_ibus`)
+## Command dictionary (`send_ibus`)
 
-Procesy MMI wysyłają tekstowe komendy (np. `GIKS\r`, `SAUD,0,0,0`, `NAOK,1,2,1`, `SDIS,1,%d`). `send_ibus` tłumaczy je na binarne ramki według tablicy: adres docelowy + dwa bajty funkcji.
+The MMI processes send text commands (e.g. `GIKS\r`, `SAUD,0,0,0`, `NAOK,1,2,1`, `SDIS,1,%d`). `send_ibus` translates them into binary frames from a table: destination address + two function bytes.
 
-| Komenda | Adres | Funkcja |
+| Command | Address | Function |
 |---|---|---|
 | CSIC, CCNF | 3B | F0 00 |
 | SDST | 3B | 3A 23 |
 | NAOK | 3B | 3A 00 |
-| SAUD | 3B | 68 4E (4 bajty danych) |
+| SAUD | 3B | 68 4E (4 data bytes) |
 | SDIS, CDSP | 3B | F0 3F |
 | CCTL, SMOS | 3B | F0 4F |
 | STIM / SDAT | 3B | 80 40 (4) |
 | GTIM / GDAT | 3B | 80 41 (4) |
-| **GIKS** | 3B | **80 10**: zapytanie o stan przycisków (hipoteza: „Get Input Keys State”) |
+| **GIKS** | 3B | **80 10**: query of the button state (hypothesis: "Get Input Keys State") |
 | SGTS | 3B | 67 02 |
 | SNAS | 7F | 67 02 |
 | STVS | 3B | BB 4F |
 | DACK, DACB, DACR, DACE, DACN | 3B | 3F A0, A1, A2, B0, FF |
 | DREQ, DIRE, DRTM | 3B | 3F A0 |
-| NACK…NRCP | 7F | 3F A0… (odpowiedniki z adresem 0x7F) |
+| NACK…NRCP | 7F | 3F A0… (counterparts with address 0x7F) |
 
-## Przepływ w OS-9
+## Flow in OS-9
 
-- `recv_ibus` odbiera ramki z `/nav_bus` (`$7b0a`, do 0x25 bajtów), patrz „Którędy przychodzą do nawigacji”.
-- Zmiany stanu z modułu trafiają do tablicy zmiennych stanu (`$a2e2`) i generują 2-bajtowe zdarzenia `[kod][arg]` (0xB3–0xBD) do `/pipe/i2c_trigger`.
-- `device_dialog` czyta `i2c_trigger`, `bsi_nav_in` i `bsi_ctrl_c`, a odpowiada komendami tekstowymi przez `uni_requests` → `send_ibus` → I2C.
-- Pilot IR (RC5) to osobna droga: slave C166 → `/rc5` (h_ibus_dr) → `recv_ibus`.
+- `recv_ibus` receives frames from `/nav_bus` (`$7b0a`, up to 0x25 bytes), see "How they reach the navigation".
+- State changes from the module go into the state variable table (`$a2e2`) and generate 2-byte events `[code][arg]` (0xB3–0xBD) to `/pipe/i2c_trigger`.
+- `device_dialog` reads `i2c_trigger`, `bsi_nav_in` and `bsi_ctrl_c`, and answers with text commands through `uni_requests` → `send_ibus` → I2C.
+- The IR remote (RC5) is a separate path: C166 slave → `/rc5` (h_ibus_dr) → `recv_ibus`.
 
-## Adresacja komunikatów (potwierdzone)
+## Message addressing (confirmed)
 
-Komunikat wewnętrzny ma postać `[źródło][cel][funkcja][dane]`. Na magistrali dochodzi jeszcze bajt długości: `[slot][źródło][długość od siebie do końca][cel][funkcja][dane]`.
+An internal message has the form `[source][destination][function][data]`. On the bus there is also a length byte: `[slot][source][length from itself to the end][destination][function][data]`.
 
-- 0x3B to nawigacja. Cele 0xBF, 0xE7 i 0xFF `recv_ibus` traktuje jak 0x3B.
-- 0x80 to serwer stanu auta (kluczyk). `GIKS` = `3B→80 fn 0x10` („Get Ignition Key State”), odpowiedź `80→3B fn 0x11`, wartość 0/1/3/7 = położenie kluczyka. To nie są przyciski.
-- 0x3A to panel. `3A→3B fn 0x48` to przycisk, a `3A→3B fn 0x49` to pokrętło.
-- 0xF0 to źródło zastępcze dla ramek przepisywanych przez `recv_ibus`.
+- 0x3B is the navigation. `recv_ibus` treats the destinations 0xBF, 0xE7 and 0xFF like 0x3B.
+- 0x80 is the car state server (the key). `GIKS` = `3B→80 fn 0x10` ("Get Ignition Key State"), answer `80→3B fn 0x11`, value 0/1/3/7 = key position. These are not buttons.
+- 0x3A is the panel. `3A→3B fn 0x48` is a button, and `3A→3B fn 0x49` is the knob.
+- 0xF0 is the substitute source for frames rewritten by `recv_ibus`.
 
-Tablica routingu w `recv_ibus` (dane, offset 0x1096; `[źródło][cel][funkcja] → handler`): 67 3B 01, 67 7F 01, 80 3B 11, F0 3B 11, 80 3B 23, 80 3B 24, 3A 3B 48/49/00/19/21/23/5B, F0 3B 43, 3F 3B 04/14/05/30/00/01/0E/0F/9F/9E, 3F 7F 04/14/05/30/00/01/0E/0F/0B/9F/9E/40.
+Routing table in `recv_ibus` (data, offset 0x1096; `[source][destination][function] → handler`): 67 3B 01, 67 7F 01, 80 3B 11, F0 3B 11, 80 3B 23, 80 3B 24, 3A 3B 48/49/00/19/21/23/5B, F0 3B 43, 3F 3B 04/14/05/30/00/01/0E/0F/9F/9E, 3F 7F 04/14/05/30/00/01/0E/0F/0B/9F/9E/40.
 
-## Przyciski: `3A 3B 48 <bajt>` (handler `recv_ibus+0x64C`)
+## Buttons: `3A 3B 48 <byte>` (handler `recv_ibus+0x64C`)
 
-Bity 0–5 to kod, bit 6 to flaga (dla kodów 2 i 3 zdarzenie idzie tylko przy wyzerowanym bicie 6, czyli przy wciśnięciu), bit 7 to flaga.
+Bits 0–5 are the code, bit 6 is a flag (for codes 2 and 3 the event is only sent with bit 6 clear, i.e. on press), bit 7 is a flag.
 
-| Kod | Zdarzenie | Klawisz (test „check KEY” w diagnozie) |
+| Code | Event | Key (the "check KEY" test in diagnostics) |
 |---|---|---|
 | 0 | 0x9B → `i2c_trigger` | Mute NAV |
 | 1 | 0x94 → `i2c_trigger` | Last message |
 | 2 | 0xB3 (arg 1) → `i2c_trigger` | VOL+ |
 | 3 | 0xB4 → `i2c_trigger` | VOL− |
-| 4 | 0x83 → `i2c_trigger` | wciśnięcie pokrętła (otwiera menu) |
-| 8 | 0x93 → callback MMI | Stand by (gasi ekran) |
-| 9 | 0xC0 → callback MMI | Address book |
-| 7, 12 | 0xC1 → callback MMI | autotest diagnostyczny (czerwony ekran „auto test not ok”); brak przycisku na panelu, pewnie wejście serwisowe |
-| 5, 6, 10, 11 | brak obsługi | — |
+| 4 | 0x83 → `i2c_trigger` | knob push (opens the menu) |
+| 8 | 0x93 → MMI callback | Stand by (screen off) |
+| 9 | 0xC0 → MMI callback | Address book |
+| 7, 12 | 0xC1 → MMI callback | diagnostic self-test (red "auto test not ok" screen); no button on the panel, probably a service input |
+| 5, 6, 10, 11 | not handled | — |
 
-Panel: 6 przycisków i pokrętło (A/B i wciśnięcie), 9 przewodów. Moduł pośredni ma 11 wejść.
+Panel: 6 buttons and a knob (A/B and push), 9 wires. The intermediate module has 11 inputs.
 
-## Pokrętło: `3A 3B 49 <bajt>` (handler `recv_ibus+0x736`)
+## Knob: `3A 3B 49 <byte>` (handler `recv_ibus+0x736`)
 
-Bity 0–5 to liczba kroków, bit 6 to kierunek (ujemny). Wynik to zdarzenie 0x80 z wartością ze znakiem do `i2c_trigger`.
+Bits 0–5 are the number of steps, bit 6 is the direction (negative). The result is event 0x80 with a signed value to `i2c_trigger`.
 
-## Pilot RC5: `/pack/rc5keys`
+## RC5 remote: `/pack/rc5keys`
 
-`recv_ibus` czyta po 1 bajcie i zamienia kod na gotowy komunikat. Są trzy tablice (wybierane kodem 0x57 albo 0x62, czyli dwa typy pilota):
+`recv_ibus` reads 1 byte at a time and turns the code into a ready message. There are three tables (selected by code 0x57 or 0x62, i.e. two remote types):
 
-| RC5 | Komunikat | RC5 | Komunikat |
+| RC5 | Message | RC5 | Message |
 |---|---|---|---|
 | 57 / 62 | `F0 3B 48 05` | 52 | `F0 3B 48 0D` |
 | 55 / 60 | `F0 3B 49 21` | D5 / E0 | `F0 3B 49 23` |
@@ -97,30 +97,30 @@ Bity 0–5 to liczba kroków, bit 6 to kierunek (ujemny). Wynik to zdarzenie 0x8
 | 3E / 77 | `F0 3B 48 1C` | 2E | `F0 3B 48 1D` |
 | 47 | `F0 3B 48 1E` | 7E | `67 3B 00 01` |
 
-Kody ruchu (fn 0x49) to cztery kierunki (bity 7/6) razy 1 albo 3 kroki (bit 7 kodu RC5 = szybciej).
+The movement codes (fn 0x49) are four directions (bits 7/6) times 1 or 3 steps (bit 7 of the RC5 code = faster).
 
-## Którędy przychodzą do nawigacji (potwierdzone)
+## How they reach the navigation (confirmed)
 
-Przez `/nav_bus`. `recv_ibus` otwiera go jako ścieżkę 8 i rejestruje sygnał 0x2829 (SS_SSig). `vbnavi2c` zwraca dla SS_SSig status 0x6000 (asynchronicznie), a `vbf` wysyła sygnał dopiero po odebraniu ramki. Czytnik `recv_ibus+$7b0a` czyta do 0x25 bajtów i ma trzy tryby, wybierane konfiguracją:
+Through `/nav_bus`. `recv_ibus` opens it as path 8 and registers signal 0x2829 (SS_SSig). For SS_SSig `vbnavi2c` returns status 0x6000 (asynchronous), and `vbf` only sends the signal after a frame has been received. The reader `recv_ibus+$7b0a` reads up to 0x25 bytes and has three modes, selected by configuration:
 
-- `(-$6d46)` = 1 (tak jest w 0209): tryb raw, komunikat to bajty ramki bez zmian, więc źródło 0x3A zostaje;
-- `(-$6d4a)` = 1: `F0 3B` + bajty od 3. (źródło zastąpione);
-- domyślnie: `F0 3B` + bajty od 5.; fn 0xA8 (RDS) idzie osobno, fn 0/1/3 to uzgadnianie.
+- `(-$6d46)` = 1 (as on 0209): raw mode, the message is the frame bytes unchanged, so the source 0x3A stays;
+- `(-$6d4a)` = 1: `F0 3B` + the bytes from the 3rd on (source replaced);
+- default: `F0 3B` + the bytes from the 5th on; fn 0xA8 (RDS) goes separately, fn 0/1/3 are the handshake.
 
-Sekwencja na I2C (emulowana w `carin.cpp`, `car_frame`):
+Sequence on I2C (emulated in `carin.cpp`, `car_frame`):
 
-1. Moduł podnosi linię uwagi (IRQ4).
-2. `vbnavi2c` czyta status z 0x51 (1 bajt): 0x13 = slot 1 ma ramkę.
-3. Zapis `01 01` do 0x50, potem odczyt 0x50 bajtów z 0x51: ramka `[src][len][dst][fn][dane]`, len liczy siebie i bajty po sobie (dla przycisku `3A 04 3B 48 kod`).
-4. `recv_ibus` dostaje `3A 3B 48 kod` i przekazuje do handlera `+0x64C`.
+1. The module raises the attention line (IRQ4).
+2. `vbnavi2c` reads the status from 0x51 (1 byte): 0x13 = slot 1 has a frame.
+3. Write `01 01` to 0x50, then read 0x50 bytes from 0x51: the frame `[src][len][dst][fn][data]`, len counts itself and the bytes after it (for a button `3A 04 3B 48 code`).
+4. `recv_ibus` gets `3A 3B 48 code` and passes it to the handler `+0x64C`.
 
-Pozostałe źródła w `recv_ibus` (sygnały 0x2821–0x2829 po kolei): 0x2821 `/pack/rc5keys`, 0x2822 `/rc5` (h_ibus_dr, kanał skrzynki 8; kody RC5 zamieniane na `F0 3B 48/49`, routing ich nie ma, więc pilot nie steruje MMI w tej konfiguracji), 0x2824 moduł danych `rds_test_if_conf`, 0x2825 `rds_time`, 0x2826 `/c0/_129` (ARCNET, czytnik `$7a88`: `[src][len]` i len bajtów), 0x2829 `/nav_bus`.
+Other sources in `recv_ibus` (signals 0x2821–0x2829 in order): 0x2821 `/pack/rc5keys`, 0x2822 `/rc5` (h_ibus_dr, mailbox channel 8; RC5 codes turned into `F0 3B 48/49`, which the routing table does not have, so the remote does not control the MMI in this configuration), 0x2824 the data module `rds_test_if_conf`, 0x2825 `rds_time`, 0x2826 `/c0/_129` (ARCNET, reader `$7a88`: `[src][len]` and len bytes), 0x2829 `/nav_bus`.
 
-### Kanał 8 (h_ibus_dr) w emulatorze
+### Channel 8 (h_ibus_dr) in the emulator
 
-Powiadomienie bez żądania: typ 6, payload `01` (są dane). Odczyt: żądanie typu 2, odpowiedź typu 0 z danymi. Każdy odczyt zużywa jedno powiadomienie. Przerwanie od odpowiedzi musi przyjść z opóźnieniem (sterownik ustawia flagę oczekiwania `$74` dopiero po wysłaniu żądania). Funkcja `car_rc5` w `carin.cpp`.
+Unsolicited notification: type 6, payload `01` (data available). Read: a type 2 request, a type 0 answer with the data. Every read consumes one notification. The interrupt for the answer must come with a delay (the driver sets the waiting flag `$74` only after sending the request). Function `car_rc5` in `carin.cpp`.
 
-## Do ustalenia
+## To be found out
 
-1. Dlaczego autotest (kody 7/12) kończy się „not ok”: którego testu emulator nie spełnia.
-2. Czy kody 5, 6, 10, 11 coś znaczą w teście „check KEY”.
+1. Why the self-test (codes 7/12) ends with "not ok": which test the emulator does not satisfy.
+2. Whether codes 5, 6, 10, 11 mean anything in the "check KEY" test.

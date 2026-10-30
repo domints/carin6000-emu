@@ -1,12 +1,10 @@
 """Spatial index parts of the map tables (units of kind 8 and 9 between a table's index start and its
-data start) and the index directory (table 4), which gives every indexed table its grid extent and
+data start) and the index directory in block 2, which gives every indexed table its grid extent and
 zoom range.
 
-Index directory (table 4: block 2 on the reference disc, blocks 3-6 on the newer one): 28-byte
-records from 0x14: u32 index start pointer, i32 x0, y0, x1, y1 (the grid extent, a square of 2^29
-units on the reference disc, 3 * 2^29 on the newer one, the same for all tables), u16 a (meaning
-open), u16 zoom from, u16 zoom to, u16 0. Kind 9 units may be zlib-compressed (+6 == 2) on the
-newer disc.
+Index directory (table 4, block 2): 28-byte records from 0x14: u32 index start pointer, i32 x0, y0,
+x1, y1 (the grid extent, 2^29 units square, the same for all tables), u16 a (meaning open), u16 zoom
+from, u16 zoom to, u16 0.
 
 Kind 8 units: slot 0 (word 8 offset, word 10 count) holds u32 pointers to kind 9 units, 0 = empty,
 u32 0x0c = top cell size;
@@ -18,114 +16,53 @@ in this unit (0 = no data there). Every subcell points to the one data unit cove
 import math
 import struct
 
-from .carindb import BLOCK, block_size, read_blocks, read_unit, table_directory
-from .unpack import zlib_unit
+from .carindb import BLOCK, read_unit
 
 
 def directory(f):
-    """{index start pointer: (x0, y0, x1, y1, a, zoom_from, zoom_to)} from table 4 (block 2 on the
-    reference disc, blocks 3-6 on the newer one: located through the table directory). The extent
-    is a square, 2^29 units on the reference disc, 3 * 2^29 on the newer one."""
-    blk, n = table_directory(f).get(4, ((0, 0), (2, 1), (2, 1)))[1]
-    d = read_blocks(f, blk, max(n, BLOCK // block_size(f)))
+    """{index start pointer: (x0, y0, x1, y1, a, zoom_from, zoom_to)} from block 2."""
+    f.seek(2 * BLOCK)
+    d = f.read(BLOCK)
     out = {}
-    for o in range(0x14, len(d) - 28, 28):
+    for o in range(0x14, BLOCK - 28, 28):
         ptr, x0, y0, x1, y1, a, z0, z1, pad = struct.unpack_from(">I4i4H", d, o)
-        if not (x0 or y0 or x1 or y1):
-            continue                    # all zero, or a table without index (18 on the newer disc)
-        if x1 - x0 != y1 - y0 or x1 <= x0 or (x1 - x0) % (1 << 29):
-            break                       # past the list
+        if x1 - x0 != 1 << 29:
+            if ptr or x0 or y0 or x1 or y1:
+                break
+            continue                    # an all-zero record
         if ptr:                         # ptr 0: the table is empty (encoder output)
             out[ptr] = (x0, y0, x1, y1, a, z0, z1)
     return out
 
 
-def index_unit(f, ptr):
-    """A kind 8 / 9 unit as the device has it in RAM: zlib units (+6 == 2, the kind 9 leaves on the
-    newer disc) decompressed."""
-    u = read_unit(f, ptr)
-    return zlib_unit(u, block_size(f)) if u[6] == 2 else u
-
-
-class Index:
-    """The index part of one table, between block first and the data start. Opening it reads only
-    the kind 8 unit headers (where each unit's run of top cells lies); a box lookup then reads the
-    kind 8 units holding the top cells under the box and their kind 9 leaves, nothing else."""
-
-    def __init__(self, f, first, data):
-        self.f = f
-        self.tops = []                   # (kind 8 unit pointer, first top cell, cell count)
-        n, b = 0, first
-        while b < data:
-            h = read_blocks(f, b, 1)
-            ptr, kind = struct.unpack_from(">IH", h, 0)
-            if kind != 8 or ptr >> 8 != b:
-                break
-            if h[6] == 2:                # slot 0 lies in the compressed payload
-                h = index_unit(f, ptr)
-            cnt, = struct.unpack_from(">H", h, 10)
-            self.tops.append((ptr, n, cnt))
-            n += cnt
-            b += ptr & 0xFF
-        ptr0 = self.tops[0][0] if self.tops else 0
-        self.extent = directory(f)[ptr0][:4]
-        self.grid = math.isqrt(n)        # N x N top cells, column-major over the extent
-        self.leaf = (self.extent[2] - self.extent[0]) // self.grid if self.grid else 0
-
-    def top_cells(self, box=None):
-        """Yield (x0, y0, kind 9 pointer) of the non-empty top cells overlapping box (x0, y0, x1, y1
-        in GPS units; None = all)."""
-        ex, ey, N, L = self.extent[0], self.extent[1], self.grid, self.leaf
-        if box:
-            c0, c1 = max(0, (box[0] - ex) // L), min(N - 1, (box[2] - 1 - ex) // L)
-            r0, r1 = max(0, (box[1] - ey) // L), min(N - 1, (box[3] - 1 - ey) // L)
-        else:
-            c0, c1, r0, r1 = 0, N - 1, 0, N - 1
-        if c0 > c1 or r0 > r1:
-            return
-        want = [(c * N + r0, c * N + r1 + 1) for c in range(c0, c1 + 1)]    # one run per column
-        for ptr, start, cnt in self.tops:
-            runs = [(max(a, start), min(b, start + cnt)) for a, b in want if a < start + cnt and b > start]
-            if not runs:
-                continue
-            u = index_unit(self.f, ptr)
-            off, = struct.unpack_from(">H", u, 8)
-            for a, b in runs:
-                for i, p in enumerate(struct.unpack_from(f">{b - a}I", u, off + 4 * (a - start)), a):
-                    if p:
-                        yield ex + (i // N) * L, ey + (i % N) * L, p
-
-    def cells(self, box=None):
-        """Yield (x0, y0, size, data unit pointer) of every subcell with data overlapping box (None =
-        all)."""
-        for lx, ly, p in self.top_cells(box):
-            u = index_unit(self.f, p)
-            off, cnt = struct.unpack_from(">HH", u, 8)
-            sub = math.isqrt(cnt)
-            size = self.leaf // sub
-            for k, o in enumerate(struct.unpack_from(f">{cnt}H", u, off)):
-                if not o:
-                    continue                    # no data (sea, outside the map)
-                sx, sy = lx + (k // sub) * size, ly + (k % sub) * size
-                if box and (sx >= box[2] or sx + size <= box[0] or sy >= box[3] or sy + size <= box[1]):
-                    continue
-                yield sx, sy, size, struct.unpack_from(">I", u, o)[0]
-
-    def pointers(self, box):
-        """(block, length) of the distinct data units under box, in file order: the position -> unit
-        lookup (format.md §2) the device does instead of walking a whole table."""
-        return sorted({(p >> 8, p & 0xFF) for _, _, _, p in self.cells(box) if p})
-
-
 def cells(f, first, data):
     """Yield (x0, y0, size, unit pointer) for every subcell of the index between block first and the
-    data start."""
-    return Index(f, first, data).cells()
-
-
-def pointers(f, first, data, box):
-    """(block, length) of the data units of the index part at first whose subcells overlap box."""
-    return Index(f, first, data).pointers(box)
+    data start, using the extent from the block 2 directory."""
+    f.seek(first * BLOCK)
+    ptr0, = struct.unpack_from(">I", f.read(4), 0)
+    ext = directory(f)[ptr0]
+    top, b = [], first
+    while b < data:
+        u = read_unit(f, (b << 8) | 8)
+        n = u[3]
+        if struct.unpack_from(">H", u, 4)[0] != 8:
+            break
+        off, cnt = struct.unpack_from(">HH", u, 8)
+        top += struct.unpack_from(f">{cnt}I", u, off)
+        b += n
+    grid = math.isqrt(len(top))
+    leaf = (ext[2] - ext[0]) // grid
+    for i, p in enumerate(top):
+        if not p:
+            continue
+        u = read_unit(f, p)
+        off, cnt = struct.unpack_from(">HH", u, 8)
+        sub = math.isqrt(cnt)
+        size = leaf // sub
+        lx, ly = ext[0] + (i // grid) * leaf, ext[1] + (i % grid) * leaf
+        for k, o in enumerate(struct.unpack_from(f">{cnt}H", u, off)):
+            if o:
+                yield lx + (k // sub) * size, ly + (k % sub) * size, size, struct.unpack_from(">I", u, o)[0]
 
 
 # --- writing (encoder) ---

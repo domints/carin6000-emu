@@ -62,13 +62,13 @@ static INPUT_PORTS_START( carin )
 	PORT_BIT(0x0002, IP_ACTIVE_HIGH, IPT_BUTTON2) PORT_NAME("Last message") PORT_CODE(KEYCODE_2)
 	PORT_BIT(0x0004, IP_ACTIVE_HIGH, IPT_BUTTON3) PORT_NAME("Volume +") PORT_CODE(KEYCODE_3)
 	PORT_BIT(0x0008, IP_ACTIVE_HIGH, IPT_BUTTON4) PORT_NAME("Volume -") PORT_CODE(KEYCODE_4)
-	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_BUTTON5) PORT_NAME("Knob push") PORT_CODE(KEYCODE_5)
+	PORT_BIT(0x0010, IP_ACTIVE_HIGH, IPT_BUTTON5) PORT_NAME("Knob push") PORT_CODE(KEYCODE_5) PORT_CODE(KEYCODE_ENTER)
 	PORT_BIT(0x0020, IP_ACTIVE_HIGH, IPT_BUTTON6) PORT_NAME("Auto test (key 7)") PORT_CODE(KEYCODE_6)
 	PORT_BIT(0x0040, IP_ACTIVE_HIGH, IPT_BUTTON7) PORT_NAME("Stand by") PORT_CODE(KEYCODE_7)
 	PORT_BIT(0x0080, IP_ACTIVE_HIGH, IPT_BUTTON8) PORT_NAME("Address book") PORT_CODE(KEYCODE_8)
 	PORT_BIT(0x0100, IP_ACTIVE_HIGH, IPT_BUTTON9) PORT_NAME("Auto test (key 12)") PORT_CODE(KEYCODE_9)
 	PORT_BIT(0x0200, IP_ACTIVE_HIGH, IPT_BUTTON10) PORT_NAME("Key 5 (unused)") PORT_CODE(KEYCODE_Q)
-	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_BUTTON11) PORT_NAME("Key 6 (unused)") PORT_CODE(KEYCODE_W)
+	PORT_BIT(0x0400, IP_ACTIVE_HIGH, IPT_BUTTON11) PORT_NAME("Key 6 (unused)") PORT_CODE(KEYCODE_T)
 	PORT_BIT(0x0800, IP_ACTIVE_HIGH, IPT_BUTTON12) PORT_NAME("Key 10 (unused)") PORT_CODE(KEYCODE_E)
 	PORT_BIT(0x1000, IP_ACTIVE_HIGH, IPT_BUTTON13) PORT_NAME("Key 11 (unused)") PORT_CODE(KEYCODE_R)
 	PORT_BIT(0x2000, IP_ACTIVE_HIGH, IPT_JOYSTICK_LEFT) PORT_NAME("Knob left") PORT_CODE(KEYCODE_LEFT)
@@ -89,6 +89,14 @@ static INPUT_PORTS_START( carin )
 	// Car side: key switch. Each press turns the ignition over (on at start-up, see car_input_poll).
 	PORT_START("CAR")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Ignition on/off") PORT_CODE(KEYCODE_I)
+
+	// The simulated car (car_sim_tick): the speed stays where the pedals leave it (cruise control).
+	PORT_START("CAR_DRIVE")
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Car: accelerate") PORT_CODE(KEYCODE_W)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Car: brake / reverse") PORT_CODE(KEYCODE_S)
+	PORT_BIT(0x04, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Car: steer left") PORT_CODE(KEYCODE_A)
+	PORT_BIT(0x08, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Car: steer right") PORT_CODE(KEYCODE_D)
+	PORT_BIT(0x10, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Car: stop") PORT_CODE(KEYCODE_Z)
 
 	PORT_START("SERVICE")
 	PORT_CONFNAME( 0x01, 0x00, "Service mode" )
@@ -223,6 +231,19 @@ void carin_state::machine_start()
 	m_car_notify_timer = timer_alloc(FUNC(carin_state::car_notify_tick), this);
 	m_car_notify_timer->adjust(attotime::from_msec(2), 0, attotime::from_msec(2));
 	save_item(NAME(m_car_notifies));
+	m_car_sim_timer = timer_alloc(FUNC(carin_state::car_sim_tick), this);
+	m_car_sim_timer->adjust(attotime::from_msec(50), 0, attotime::from_msec(50));
+	save_item(NAME(m_car_latitude));
+	save_item(NAME(m_car_longitude));
+	save_item(NAME(m_car_heading));
+	save_item(NAME(m_car_speed));
+	save_item(NAME(m_car_odometer));
+	save_item(NAME(m_car_gps_fix));
+	save_item(NAME(m_dr_distance));
+	save_item(NAME(m_dr_turn));
+	save_item(NAME(m_dr_error));
+	save_item(NAME(m_dr_last));
+	save_item(NAME(m_dr_record));
 	save_item(NAME(m_cd_driver_ready));
 	save_item(NAME(m_cd_reported));
 
@@ -739,9 +760,21 @@ int32_t carin_state::gps_longitude() const { return int32_t(std::lround((m_car_l
 
 // Slave HLE, h_itc subsystem 0xB2 = dead reckoning: every second the slave answers dp with a service
 // 0x83 record (19 little-endian longs, the layout dp sent) in the subsystem page 0x9FB200 and announces
-// it on channel 6 (type 6, data = event 0xF5). The slave keeps the sensor part of the last record dp
-// wrote (service 2) and puts in the position (L3 longitude, L4 latitude, the GPS units) with the valid
-// bit. dp maps L3/L4 straight into its position; with a position the status line satellite turns green.
+// it on channel 6 (type 6, data = event 0xF5). The slave keeps the sensor configuration from the last
+// record dp wrote (service 2: start-up, relocation) and fills in the car. dp reads L0-L5 as longs and
+// only the low word of L6-L18 (from static analysis of dp 0209, distances in cm as in coord_tables):
+//   L0 time (ms)           L3 latitude, L4 longitude (GPS units, longitude +30 like the map DB): the slave's position
+//   L6 heading (0.01 degree, 0-35999, clockwise from north)    L7 speed (cm/s)
+//   L8 + L9 position error (cm): dp moves its map-matched position over to L3/L4 once the two are
+//        further apart than a multiple of it (and the GPS was good for a while, see L15)
+//   L15 status: bit 15 valid, bit 9 heading from GPS (lets dp correct its heading and move over),
+//        bit 5 GPS good (dp counts these), bit 3 position jumped (see below), bit 2 blocks moving
+//        over (dp's own record has it set)
+//   L16 time since the last record (10 ms)   L17 heading change (0.01 degree)   L18 distance (cm)
+// dp's map-matched position only follows L17/L18; it moves over to L3/L4 as described for L8/L9,
+// or at once when bit 3 is set, L3/L4 moved more than 750 m since the last record and lie more than
+// 250 m from dp's position (dp 0209 +0x1a04). The slave sets bit 3 when the car is far from where
+// it was in the last record or from where dp's record (start-up, relocation) put it.
 TIMER_CALLBACK_MEMBER(carin_state::slave_dr_tick)
 {
 	const uint32_t page = 0xb200;
@@ -758,8 +791,34 @@ TIMER_CALLBACK_MEMBER(carin_state::slave_dr_tick)
 		}
 		m_trace.line(carin_trace::EVENTS, trace_time(), "dp position record %s", dump);
 	}
-	put_u32le(&m_dr_record[0x0c], gps_longitude());
-	put_u32le(&m_dr_record[0x10], gps_latitude());
+	const attotime now = machine().time();
+	const int32_t distance = int32_t(std::lround(m_dr_distance));
+	const int32_t turn = int32_t(std::lround(m_dr_turn));
+	m_dr_distance -= distance;   // keep what did not fit the units for the next record
+	m_dr_turn -= turn;
+	const bool moving = std::fabs(m_car_speed) >= 1.0;
+	uint32_t status = 0x8000;
+	if (m_car_gps_fix)
+		status |= 0x0020 | (moving ? 0x0200 : 0);
+	// Far from the last position (ours or dp's): about 0.0045 degree = 500 m, in GPS units.
+	const double lat_jump = double(int32_t(get_u32le(&m_dr_record[0x0c]))) - gps_latitude();
+	const double lon_jump = double(int32_t(get_u32le(&m_dr_record[0x10]))) - gps_longitude();
+	const double jump = std::hypot(lat_jump, lon_jump * std::cos(m_car_latitude * M_PI / 180.0)) * 1.8e-7 * 111320.0;
+	if (jump > 500)
+		status |= 0x0008;
+	const uint32_t error = uint32_t(std::min(m_dr_error, 65535.0));
+	put_u32le(&m_dr_record[0x00], uint32_t(now.as_double() * 1000));
+	put_u32le(&m_dr_record[0x0c], gps_latitude());
+	put_u32le(&m_dr_record[0x10], gps_longitude());
+	put_u32le(&m_dr_record[0x18], uint32_t(std::lround(m_car_heading * 100)) % 36000);
+	put_u32le(&m_dr_record[0x1c], uint16_t(int16_t(std::lround(m_car_speed * 100))));
+	put_u32le(&m_dr_record[0x20], error);
+	put_u32le(&m_dr_record[0x24], error);
+	put_u32le(&m_dr_record[0x3c], status);
+	put_u32le(&m_dr_record[0x40], uint32_t(std::clamp<double>((now - m_dr_last).as_double() * 100, 1, 0x7fff)));
+	put_u32le(&m_dr_record[0x44], uint16_t(int16_t(std::clamp<int32_t>(turn, -0x7fff, 0x7fff))));
+	put_u32le(&m_dr_record[0x48], uint16_t(int16_t(std::clamp<int32_t>(distance, -0x7fff, 0x7fff))));
+	m_dr_last = now;
 	set_shared_byte(page + 1, 1);
 	set_shared_byte(page + 2, 0x83);
 	set_shared_byte(page + 3, shared_byte(page + 3) + 1);   // update counter (GetStat 0x802 "new data")
@@ -767,13 +826,13 @@ TIMER_CALLBACK_MEMBER(carin_state::slave_dr_tick)
 	set_shared_byte(page + 5, sizeof(m_dr_record));
 	for (unsigned i = 0; i < sizeof(m_dr_record); i++)
 		set_shared_byte(page + 6 + i, m_dr_record[i]);
-	set_shared_byte(page + 6 + 0x3e, m_dr_record[0x3e] | 0x80);   // struct word 0x2a bit 15: valid
 	set_shared_byte(page + 1, 0);
 	// The announcement is an h_itc event code, not the subsystem: dp subscribes event 0xF5 on /h_itc/e
 	// and reads the B2 record when it arrives.
 	static const uint8_t notify[1] = { 0xf5 };
 	if (mbox_post(6, 6, notify, sizeof(notify)))
-		m_trace.line(carin_trace::EVENTS, trace_time(), "slave position record (B2/83)");
+		m_trace.line(carin_trace::EVENTS, trace_time(), "slave position record (B2/83): %.6f %.6f heading %u speed %d cm/s distance %d cm turn %d status %04X",
+				m_car_latitude, m_car_longitude, get_u32le(&m_dr_record[0x18]), int16_t(get_u32le(&m_dr_record[0x1c])), distance, turn, status);
 	m_gps_pending = true;
 }
 
@@ -801,14 +860,15 @@ bool carin_state::slave_gps_record()
 	// long 3 latitude, 4 longitude, 5 height (dm); long 8 bits 0-15 satellites tracked (dp: "TRK"
 	// without a fix), long 9 bits 16-31 satellites used (?); long 20 bits 16-31 fix (2 = 2D, 3 = 3D);
 	// long 21 bits 16-23 flags (bit 6 receiver answers, bit 0 almanac (?), bit 2 position valid, bit 3 fix).
+	// Without a fix (antenna covered) the receiver still answers, tracking nothing.
 	uint32_t longs[36] = {};
 	longs[3] = gps_latitude();
 	longs[4] = gps_longitude();
 	longs[5] = 1000;
-	longs[8] = 6;
-	longs[9] = 6u << 16;
-	longs[20] = 3u << 16;
-	longs[21] = 0x4du << 16;
+	longs[8] = m_car_gps_fix ? 6 : 0;
+	longs[9] = m_car_gps_fix ? 6u << 16 : 0;
+	longs[20] = m_car_gps_fix ? 3u << 16 : 0;
+	longs[21] = (m_car_gps_fix ? 0x4du : 0x40u) << 16;
 	set_shared_byte(page + 1, 1);
 	set_shared_byte(page + 2, 0x82);
 	set_shared_byte(page + 3, shared_byte(page + 3) + 1);
@@ -818,6 +878,83 @@ bool carin_state::slave_gps_record()
 		set_shared_byte(page + 6 + i, uint8_t(longs[i / 4] >> (24 - 8 * (i & 3))));
 	set_shared_byte(page + 1, 0);
 	return true;
+}
+
+// Car side: the simulated car, 20 times a second. The pedals change the speed, which then stays
+// (cruise control); steering turns the car on a circle of at least 6 m, at most 25 degrees a second.
+// What it drives and turns is summed up for the next B2 record. It runs while the unit is off too.
+TIMER_CALLBACK_MEMBER(carin_state::car_sim_tick)
+{
+	constexpr double dt = 0.05;
+	constexpr double earth_radius = 6378137.0;
+	car_sim_command();
+
+	const uint32_t drive = m_car_drive->read();
+	if (BIT(drive, 0))
+		m_car_speed = std::min(m_car_speed + 2.5 * dt, 50.0);
+	if (BIT(drive, 1))
+		m_car_speed = std::max(m_car_speed - 4.0 * dt, -5.0);
+	if (BIT(drive, 4))
+		m_car_speed = 0;
+	const int steer = BIT(drive, 3) - BIT(drive, 2);
+	const double yaw = steer * std::min(25.0, std::fabs(m_car_speed) / 6.0 * 180.0 / M_PI) * (m_car_speed < 0 ? -1 : 1);
+	m_car_heading = std::fmod(m_car_heading + yaw * dt + 360.0, 360.0);
+
+	const double step = m_car_speed * dt;
+	const double heading = m_car_heading * M_PI / 180.0;
+	m_car_latitude += step * std::cos(heading) / earth_radius * 180.0 / M_PI;
+	m_car_longitude += step * std::sin(heading) / (earth_radius * std::cos(m_car_latitude * M_PI / 180.0)) * 180.0 / M_PI;
+	m_car_longitude = std::remainder(m_car_longitude, 360.0);
+	m_car_odometer += std::fabs(step);
+	m_dr_distance += step * 100;
+	m_dr_turn += yaw * dt * 100;
+	// With a fix the slave trusts its position to about 5 m (each of L8/L9); without one it gets
+	// worse with every metre driven.
+	m_dr_error = m_car_gps_fix ? 500 : std::min(m_dr_error + std::fabs(step) * 3, 65535.0);
+
+	m_car_view[0] = int32_t(std::lround(m_car_latitude * 1e7));
+	m_car_view[1] = int32_t(std::lround(m_car_longitude * 1e7));
+	m_car_view[2] = int32_t(std::lround(m_car_heading * 100));
+	m_car_view[3] = int32_t(std::lround(m_car_speed * 100));
+	m_car_view[4] = int32_t(m_car_odometer);
+	m_car_view[5] = (m_car_gps_fix ? 1 : 0) | (m_dr_timer->enabled() ? 2 : 0);
+	m_car_view[6] = s32(m_car_cmd[0]);
+}
+
+// The car window's commands (outputs, the window writes them): the arguments, then a new sequence
+// number in car_cmd0; car_view6 says which one was carried out. car_cmd1: 1 = move the car to
+// (car_cmd2, car_cmd3) = (lat, lon) in 1e-7 degrees, 2 = heading (0.01 degree), 3 = speed (cm/s),
+// 4 = GPS antenna (0 covered, 1 free).
+void carin_state::car_sim_command()
+{
+	const s32 arg1 = m_car_cmd[2], arg2 = m_car_cmd[3];
+	if (s32(m_car_cmd[0]) == s32(m_car_view[6]))
+		return;
+	switch (s32(m_car_cmd[1]))
+	{
+	case 1:
+		m_car_latitude = std::clamp(arg1 * 1e-7, -89.0, 89.0);
+		m_car_longitude = std::remainder(arg2 * 1e-7, 360.0);
+		m_trace.line(carin_trace::EVENTS, trace_time(), "car moved to %.7f %.7f", m_car_latitude, m_car_longitude);
+		break;
+	case 2:
+		m_car_heading = std::fmod(arg1 / 100.0 + 360.0, 360.0);
+		break;
+	case 3:
+		m_car_speed = std::clamp(arg1 / 100.0, -5.0, 50.0);
+		break;
+	case 4:
+		m_car_gps_fix = arg1 != 0;
+		m_trace.line(carin_trace::EVENTS, trace_time(), "GPS antenna %s", m_car_gps_fix ? "free" : "covered");
+		break;
+	}
+}
+
+// The car window: an empty screen, the carsim plugin draws on its container.
+uint32_t carin_state::carsim_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect)
+{
+	bitmap.fill(rgb_t(0x14, 0x16, 0x1a), cliprect);
+	return 0;
 }
 
 TIMER_CALLBACK_MEMBER(carin_state::master_reset)
@@ -855,6 +992,9 @@ void carin_state::machine_reset()
 	m_mbox_reply_timer->adjust(attotime::never);
 	m_master_reset_timer->adjust(attotime::never);
 	m_dr_timer->adjust(attotime::never);
+	// The car keeps going; only what the slave accumulated for dp starts over.
+	m_dr_distance = m_dr_turn = 0;
+	m_dr_last = machine().time();
 	m_mbox_irq_channel = 0;
 	m_cdic_irq = false;
 	m_car_navbus_attention = false;
@@ -1249,6 +1389,13 @@ void carin_state::carin(machine_config &config)
 	m_vsc->set_addrmap(0, &carin_state::vsc_map);
 	m_vsc->set_screen("screen");
 	m_vsc->irq().set(FUNC(carin_state::vsc_irq_w));
+
+	// The car simulator window (view "Car simulator", plugin carsim); not part of the unit.
+	screen_device &carsim(SCREEN(config, "carsim"));
+	carsim.set_refresh_hz(30);
+	carsim.set_size(640, 480);
+	carsim.set_visarea_full();
+	carsim.set_screen_update(FUNC(carin_state::carsim_update));
 
 	CDI220_LCD(config, m_lcd);
 	// The VSC outputs 8-bit colour indexes; where CARiN keeps its colour table is not known yet, so this

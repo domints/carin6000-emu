@@ -1,7 +1,8 @@
 """Search tables for the encoder (docs/format.md section 7): countries (b, block 4) and their name
 trie (c, block 3), city name trie (e), cities (d), street tries per city (10), streets with house
 number ranges (f). The POI tables (7, 11, 12) come from libs/osmpoi.py; here the cities and the
-country get their POI category lists (d slot 3, block 4 slot 3).
+countries get their POI category lists (d slot 3, block 4 slot 3). A disc can hold several
+countries; each has its own city trie, the tables are shared.
 
 Cities are the gminas (municipality = powiat) and the settlements (municipality = gmina), as in
 the original; a gmina's streets have one entry for the whole gmina plus one per settlement, a
@@ -14,36 +15,28 @@ from dataclasses import dataclass, field
 
 from .carindb import BLOCK
 
-LANG = 0x12              # Polish; set_language() for other countries
 ROTATED = 0x1000
 LEAF_MAX = 150           # a trie node becomes a leaf at this many entries (original leaves: up to ~160)
 UNIT_MAX = 8 * BLOCK
 
 
-def set_language(lang, street_words):
-    """Name flags and street rotation rule of the country being encoded."""
-    global LANG, STREET_FIRST
-    LANG, STREET_FIRST = lang, street_words
-
-
-STREET_FIRST = True      # streets start with a street word ("ulica ...") that moves in rotations
-
-
-def rotations(name, street=True):
-    """The name and its word rotations: for streets the leading street word ("ulica") goes where
-    the rotation cuts; no rotation starts with a number."""
+def rotations(name, country, street=True):
+    """The name and its word rotations, with the country's language byte: for streets of a country
+    whose streets start with a street word ("ulica") that word goes where the rotation cuts; no
+    rotation starts with a number."""
     words = name.split()
-    out = [(name, LANG)]
-    street = street and STREET_FIRST
+    lang = country.lang
+    out = [(name, lang)]
+    street = street and country.street_prefix
     if street and len(words) >= 2:
         head, rest = words[0], words[1:]
         for i in range(len(rest)):
             if not rest[i].isdigit():
-                out.append((" ".join(rest[i:] + [head] + rest[:i]), LANG | ROTATED))
+                out.append((" ".join(rest[i:] + [head] + rest[:i]), lang | ROTATED))
     elif not street and len(words) >= 2:
         for i in range(1, len(words)):
             if not words[i].isdigit():
-                out.append((" ".join(words[i:] + words[:i]), LANG | ROTATED))
+                out.append((" ".join(words[i:] + words[:i]), lang | ROTATED))
     return out
 
 
@@ -61,6 +54,7 @@ class Item:
 class City:
     name: str
     muni: str
+    country: object                # libs/countries.Country
     pos: tuple
     seg: tuple                     # (parcel, segment index) of the city's destination segment
     entries: list = field(default_factory=list)   # [(name, flags, settlement or None, [Item])]
@@ -81,10 +75,10 @@ def _numbers(pieces):
     return (*e, *o)
 
 
-def collect(parcels, sorted_pieces, settlement_pos):
-    """Cities with their street entries from the level 0 parcels. settlement_pos(name, city) ->
-    position of a settlement or town."""
-    streets = {}                   # (city, muni, settlement, name) -> [Item]
+def collect(parcels, sorted_pieces, settlement_pos, countries):
+    """Cities with their street entries from the level 0 parcels, per country (road.country, an
+    ISO code of countries). settlement_pos(iso, name, city) -> position of a settlement or town."""
+    streets = {}                   # (country, city, muni, settlement, name) -> [Item]
     for pc in parcels:
         pieces = sorted_pieces(pc)
         i = 0
@@ -92,27 +86,29 @@ def collect(parcels, sorted_pieces, settlement_pos):
             rd = pieces[i].road
             j = i
             while j + 1 < len(pieces) and pieces[j + 1].road.name == rd.name and \
-                    pieces[j + 1].road.settlement == rd.settlement and pieces[j + 1].road.city == rd.city:
+                    pieces[j + 1].road.settlement == rd.settlement and pieces[j + 1].road.city == rd.city \
+                    and pieces[j + 1].road.country == rd.country:
                 j += 1
             if rd.name:
-                key = (rd.city, rd.muni, rd.settlement, rd.name)
-                pos = settlement_pos(rd.settlement or rd.city, rd.city)
+                key = (rd.country, rd.city, rd.muni, rd.settlement, rd.name)
+                pos = settlement_pos(rd.country, rd.settlement or rd.city, rd.city)
                 streets.setdefault(key, []).append(Item(pos, pc, i, j - i + 1, _numbers(pieces[i:j + 1])))
             i = j + 1
     cities = {}
 
-    def city(name, muni):
-        if (name, muni) not in cities:
-            cities[(name, muni)] = City(name, muni, settlement_pos(name, None if name == muni else muni), None)
-        return cities[(name, muni)]
+    def city(iso, name, muni):
+        if (iso, name, muni) not in cities:
+            cities[(iso, name, muni)] = City(name, muni, countries[iso],
+                                             settlement_pos(iso, name, None if name == muni else muni), None)
+        return cities[(iso, name, muni)]
 
     by_gmina = {}
-    for (c, m, s, n), items in streets.items():
-        by_gmina.setdefault((c, m, n), []).append((s, items))
+    for (iso, c, m, s, n), items in streets.items():
+        by_gmina.setdefault((iso, c, m, n), []).append((s, items))
         if s:
-            city(s, c).entries.append((n, None, None, items))
-    for (c, m, n), parts in by_gmina.items():
-        g = city(c, m)
+            city(iso, s, c).entries.append((n, None, None, items))
+    for (iso, c, m, n), parts in by_gmina.items():
+        g = city(iso, c, m)
         g.entries.append((n, None, None, [it for _, its in parts for it in its]))
         for s, its in parts:
             if s:
@@ -120,7 +116,7 @@ def collect(parcels, sorted_pieces, settlement_pos):
     for c in cities.values():
         rows = []
         for n, _, s, items in c.entries:
-            for text, flags in rotations(n):
+            for text, flags in rotations(n, c.country):
                 rows.append((text, flags, s, items))
         c.entries = sorted(rows, key=lambda r: (r[0], r[2] or ""))
     return list(cities.values())
@@ -352,12 +348,12 @@ def trie_table(units, where, prefix, kind, place, Unit):
     return [Unit((prefix, n), lambda resolve, n=n: build(resolve, n)) for n in range(len(units))]
 
 
-def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr, poi_list=None,
-               country_poi=()):
-    """Registers tables e, d, 10, f and blocks 3 / 4 in a dbwrite.Database. template_country = the
-    56-byte country record of the original (fields not known are kept); parcel_ptr(parcel) gives a
-    level 0 parcel's unit pointer; poi_list(key) -> (table 12 unit, offset, count) of a POI list
-    named in City.poi or country_poi ([(category, key)], the country-wide lists)."""
+def add_tables(db, cities, countries, Unit, Table, parcel_ptr, poi_list=None):
+    """Registers tables e, d, 10, f and blocks 3 / 4 in a dbwrite.Database. countries = [(Country,
+    template record, country-wide POI lists)]: the 56-byte country record of the original (fields
+    not known are kept) and [(category, key)]; parcel_ptr(parcel) gives a level 0 parcel's unit
+    pointer; poi_list(key) -> (table 12 unit, offset, count) of a POI list named in City.poi or a
+    country's lists."""
     cities = sorted(cities, key=lambda c: (c.name, c.muni))
     # f: street entries per city, leaves kept in one unit
     f_groups, f_leaf = [], {}
@@ -390,17 +386,19 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr, p
         u, off = t10_where[id(c.trie)]
         return db.resolve(("t10", u)), off, len(c.trie)
 
-    # d: city name rows (with rotations), one city record per row
-    rows = []
-    for c in cities:
-        for text, flags in rotations(c.name, street=False):
-            rows.append((text, flags, c.muni, c))
-    rows.sort(key=lambda r: (r[0], r[2] or ""))
-    d_trie = trie([r[0] for r in rows])
-    d_groups, d_leaf = [], {}
-    for leaf in leaves(d_trie):
-        d_leaf[id(leaf)] = len(d_groups)
-        d_groups.append(rows[leaf.first:leaf.first + leaf.count])
+    # d: city name rows (with rotations), one city record per row; a city trie per country
+    d_groups, d_leaf, d_tries = [], {}, {}
+    for country, _, _ in countries:
+        rows = []
+        for c in cities:
+            if c.country is country:
+                for text, flags in rotations(c.name, country, street=False):
+                    rows.append((text, flags, c.muni, c))
+        rows.sort(key=lambda r: (r[0], r[2] or ""))
+        d_tries[country.iso] = d_trie = trie([r[0] for r in rows])
+        for leaf in leaves(d_trie):
+            d_leaf[id(leaf)] = len(d_groups)
+            d_groups.append(rows[leaf.first:leaf.first + leaf.count])
     d_units = pack(d_groups, 0x0C)
     d_place, ui, used = [], 0, 0
     for g in d_groups:
@@ -433,38 +431,58 @@ def add_tables(db, cities, country, template_country, Unit, Table, parcel_ptr, p
     db.add(Table(0x0F, name_units(f_units, f_keys, 0x0E, None)))
     db.add(Table(0x10, t10_units))
     db.add(Table(0x0D, name_units(d_units, d_keys, 0x0C, city_record)))
-    e_lists, e_where = pack_lists([d_trie])
+    e_lists, e_where = pack_lists(list(d_tries.values()))
     db.add(Table(0x0E, trie_table(e_lists, e_where, "e", 0x0D, d_place_of, Unit)))
 
-    # blocks 3 (country trie) and 4 (countries)
-    name, number, iso = country
-    template_number = struct.unpack_from(">H", template_country, 40)[0]
+    # blocks 3 (country trie) and 4 (countries): name rows (slot 0) and records (slot 1) sorted by
+    # name, the countries' POI category records (slot 3), the names
+    countries = sorted(countries, key=lambda c: c[0].name)
+    n = len(countries)
+    rec = 0x30 + 8 * n
+    cats = rec + 56 * n
+    txt = cats + 12 * sum(len(lists) for _, _, lists in countries)
 
     def block4(resolve):
         d = bytearray(BLOCK)
-        rec, cats = 0x38, 0x38 + 56
-        txt = cats + 12 * len(country_poi)
-        struct.pack_into(">IHHHHHHHHHHHH", d, 0, 4 << 8 | 1, 0x0A, 0, 0x30, 1, rec, 1, 0, 0, cats,
-                         len(country_poi), 0, 0)
-        struct.pack_into(">HHHH", d, 0x30, txt, LANG, 0, rec)
-        for k, (cat, lst) in enumerate(country_poi):
-            struct.pack_into(">IHHHH", d, cats + 12 * k, *poi_list(lst), cat, txt)
-        r = bytearray(template_country)
-        u, off = e_where[id(d_trie)]
-        struct.pack_into(">IHH", r, 0, resolve(("e", u)), off, len(d_trie))
-        struct.pack_into(">HH", r, 24, cats, len(country_poi))
-        struct.pack_into(">H", r, 40, number)
-        r[46:48] = iso.encode()
-        d[rec:rec + 56] = r
-        d[txt:txt + len(name)] = name.encode("latin1")
+        struct.pack_into(">IHHHHHHHHHHHH", d, 0, 4 << 8 | 1, 0x0A, 0, 0x30, n, rec, n, 0, 0, cats,
+                         (txt - cats) // 12, 0, 0)
+        cat, name_at = cats, txt
+        for k, (country, template, lists) in enumerate(countries):
+            r_off = rec + 56 * k
+            struct.pack_into(">HHHH", d, 0x30 + 8 * k, name_at, country.lang, 0, r_off)
+            r = bytearray(template)
+            trie_root = d_tries[country.iso]
+            u, off = e_where[id(trie_root)]
+            struct.pack_into(">IHH", r, 0, resolve(("e", u)) if trie_root else 0, off, len(trie_root))
+            struct.pack_into(">HH", r, 24, cat, len(lists))
+            struct.pack_into(">H", r, 40, country.number)
+            r[46:48] = country.iso.encode()
+            d[r_off:r_off + 56] = r
+            for c_, lst in lists:
+                struct.pack_into(">IHHHH", d, cat, *poi_list(lst), c_, txt)
+                cat += 12
+            d[name_at:name_at + len(country.name)] = country.name.encode("latin1")
+            name_at += len(country.name) + 1
+        if name_at > BLOCK:
+            raise ValueError(f"block 4: {n} countries do not fit")
         return bytes(d)
+
+    firsts = []                             # country trie: one leaf per first letter
+    for k, (country, _, _) in enumerate(countries):
+        if firsts and firsts[-1][0] == country.name[0]:
+            firsts[-1][2] += 1
+        else:
+            firsts.append([country.name[0], 0x30 + 8 * k, 1])
 
     def block3(resolve):
         d = bytearray(BLOCK)
-        struct.pack_into(">IHHHH", d, 0, 3 << 8 | 1, 0x0B, 0, 0x0C, 1)
-        struct.pack_into(">IBBHHH", d, 0x0C, 4 << 8 | 1, ord(name[0]), 1, 0x30, 1, 0)
+        struct.pack_into(">IHHHH", d, 0, 3 << 8 | 1, 0x0B, 0, 0x0C, len(firsts))
+        for k, (ch, off, cnt) in enumerate(firsts):
+            struct.pack_into(">IBBHHH", d, 0x0C + 12 * k, 4 << 8 | 1, ord(ch), 1, off, cnt, 0)
         return bytes(d)
 
     db.blocks[3], db.blocks[4] = block3, block4
-    db.country_roots = 1                    # block 0 names the country trie root (block 3, 0x0c, count)
-    db.country_numbers = {number: template_number}    # block 2: settings of our country only
+    db.country_roots = len(firsts)          # block 0 names the country trie root (block 3, 0x0c, count)
+    db.country_numbers = {}                 # block 2: settings of our countries (numbers may repeat)
+    for country, template, _ in countries:
+        db.country_numbers.setdefault(country.number, struct.unpack_from(">H", template, 40)[0])

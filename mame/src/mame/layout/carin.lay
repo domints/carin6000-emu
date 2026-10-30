@@ -94,4 +94,18 @@ license:CC0-1.0
 	<view name="Console">
 		<screen tag="terminal_a:terminal:terminal_screen"><bounds x="0" y="0" width="640" height="240" /></screen>
 	</view>
+
+	<!-- Everything in one window: the unit on the left, the simulated car (plugin carsim) on the right. -->
+	<view name="Navigation, panel, console and car">
+		<element ref="background"><bounds x="0" y="0" width="1502" height="624" /></element>
+		<screen tag="screen"><bounds x="0" y="0" width="480" height="360" /></screen>
+		<group ref="panel"><bounds x="495" y="0" width="160" height="360" /></group>
+		<screen tag="terminal_a:terminal:terminal_screen"><bounds x="0" y="370" width="660" height="254" /></screen>
+		<screen tag="carsim"><bounds x="670" y="0" width="832" height="624" /></screen>
+	</view>
+
+	<!-- The simulated car alone (plugin carsim draws on the screen). -->
+	<view name="Car simulator">
+		<screen tag="carsim"><bounds x="0" y="0" width="640" height="480" /></screen>
+	</view>
 </mamelayout>

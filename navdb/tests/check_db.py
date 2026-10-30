@@ -2,7 +2,7 @@
 """Checks the structural rules of a carindb (the ones found on the original, docs/format.md) on any
 database, the original or one the encoder wrote. Every rule prints passed / failed counts.
 
-usage: check_db.py [carindb] [--every N]   (default: temp/navdb/warszawa/carindb, every parcel)
+usage: check_db.py [carindb] [--every N]   (default: temp/navdb/poland/carindb, every parcel)
 """
 import argparse
 import struct
@@ -112,14 +112,32 @@ def check_parcel(d, ptr, level, sizes, get, res):
         px0, py0, px1, py1 = struct.unpack_from(">4i", pd, 0x44)
         bx0, by0, bx1, by1 = struct.unpack_from(">4i", d, 0x44)
         res["parent contains parcel"][px0 <= bx0 and bx1 <= px1 and py0 <= by0 and by1 <= py1] += 1
-        up = set()
+        up = {}                         # parent point -> offset of its node record
         for k, size in ((5, 8), (6, 16)):
             so, sc = w(pd, 8 + 4 * k), w(pd, 10 + 4 * k)
-            up |= {(px0 + w(pd, so + size * j) * 64, py0 + w(pd, so + size * j + 2) * 64) for j in range(sc)}
+            up.update({(px0 + w(pd, so + size * j) * 64, py0 + w(pd, so + size * j + 2) * 64): so + size * j
+                       for j in range(sc)})
+        p4, pc4 = w(pd, 8 + 16), w(pd, 10 + 16)
+        parent_heads = {}               # parent node offset -> headings of its segments there
+        for i in range(pc4):
+            r = p4 + sizes[0x09] * i
+            parent_heads.setdefault(w(pd, r), set()).add(pd[r + 14])
+            parent_heads.setdefault(w(pd, r + 2), set()).add(pd[r + 15])
+        top_class = {0: 2, 1: 1, 2: 0}[level]
         for j in range(c5):
             o = s5 + 8 * j
             c = d[o + 6] >> 6
-            res["node goes up iff c + level < 3"][((x0 + w(d, o) * 64, y0 + w(d, o + 2) * 64) in up) == (c + level < 3)] += 1
+            pt = (x0 + w(d, o) * 64, y0 + w(d, o + 2) * 64)
+            res["node goes up iff c + level < 3"][(pt in up) == (c + level < 3)] += 1
+            if pt not in up:
+                continue
+            # the router finds the parent's segment by the heading at the node (rpmod FUN_000160d8)
+            heads = parent_heads.get(up[pt], set())
+            for r in segs:
+                if d[r + 16] & 15 <= top_class:
+                    for end, h in ((0, 14), (2, 15)):
+                        if w(d, r + end) == o:
+                            res["heading at an up node exists in the parent"][d[r + h] in heads] += 1
     if level > 0:
         cell = struct.unpack_from(">I", d, 0x5c)[0]
         s8, c8 = w(d, 8 + 32), w(d, 10 + 32)
@@ -138,6 +156,31 @@ def check_parcel(d, ptr, level, sizes, get, res):
                 cx, cy = x0 + i * cell + cell // 2, y0 + j * cell + cell // 2
                 c0x, c0y, c1x, c1y = struct.unpack_from(">4i", cd, 0x44)
                 res["child grid -> child at cell centre"][c0x <= cx < c1x and c0y <= cy < c1y] += 1
+        # going down: every node and edge point is in the child at its grid cell, with the
+        # headings of the segments there (the router goes down by point and heading)
+        crs = sizes[0x08] if level == 1 else sizes[0x09]
+        top_class = {1: 2, 2: 1, 3: 0}[level]
+        heads = {}
+        for r in segs:
+            for end, h in ((0, 14), (2, 15)):
+                heads.setdefault(w(d, r + end), set()).add(d[r + h])
+        for o, hs in heads.items():
+            pt = (x0 + w(d, o) * 64, y0 + w(d, o + 2) * 64)
+            i, j = (min(max((pt[k] - (x0, y0)[k]) // cell, 0), n - 1) for k in (0, 1))
+            cd = get(struct.unpack_from(">I", d, s8 + 4 * (i * n + j))[0]) if n else None
+            here = set()
+            if cd:
+                cx0, cy0 = struct.unpack_from(">ii", cd, 0x44)
+                c4, cc4 = w(cd, 8 + 16), w(cd, 10 + 16)
+                for q in range(cc4):
+                    r = c4 + crs * q
+                    if cd[r + 16] & 15 <= top_class:
+                        for end, h in ((0, 14), (2, 15)):
+                            e = w(cd, r + end)
+                            if (cx0 + w(cd, e) * 64, cy0 + w(cd, e + 2) * 64) == pt:
+                                here.add(cd[r + h])
+            key = "edge point" if s6 <= o < s6 + 16 * c6 else "node"
+            res[f"{key} and its headings exist in the child"][hs <= here] += 1
     if level == 0 and d[0x70]:
         hn = read_unit_raw(struct.unpack_from(">I", d, 0x54)[0])
         res["house number unit -> its parcel"][struct.unpack_from(">I", hn, 12)[0] == ptr and w(hn, 10) == c4] += 1
@@ -161,7 +204,7 @@ def check_parcel(d, ptr, level, sizes, get, res):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
+    p.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/poland/carindb")
     p.add_argument("--every", type=int, default=1, help="check every Nth parcel")
     args = p.parse_args()
     f = open(args.carindb, "rb")
@@ -189,8 +232,12 @@ def main():
                                   "class index (slot 3)", "segment ends are nodes", "node used by a segment",
                                   "node ring = degree", "node type by degree", "edge point reciprocal",
                                   "slot 9 = edge point neighbours", "shape ranges increase",
+                                  "heading at an up node exists in the parent",
+                                  "node and its headings exist in the child",
+                                  "edge point and its headings exist in the child",
                                   "prohibited turn -> segment at the via node",
-                                  "spatial index -> covering unit", "background layout round trip",
+                                  "spatial index -> covering unit", "index unit within 5 blocks",
+                                  "background layout round trip",
                                   "background groups and end records")}
     for tid, level in LEVELS:
         (a, _), (b, _), (c, _) = tables.get(tid, ((0, 0), (0, 0), (0, 0)))
@@ -228,6 +275,19 @@ def main():
                 d = get(ptr)
                 x0, y0, x1, y1 = struct.unpack_from(">4i", d, 0x20)
                 res["spatial index -> covering unit"][x0 <= x + size // 2 < x1 and y0 <= y + size // 2 < y1] += 1
+    # index units (kind 9) at most 5 blocks, as the original's largest: with up to 9 the device
+    # read the level 0 background index and then no unit
+    for ptr in spindex.directory(f):
+        b = ptr >> 8
+        while True:
+            u = read_unit(f, (b << 8) | 8)
+            if struct.unpack_from(">H", u, 4)[0] != 8:
+                break
+            off, cnt = struct.unpack_from(">HH", u, 8)
+            for leaf in struct.unpack_from(f">{cnt}I", u, off):
+                if leaf:
+                    res["index unit within 5 blocks"][leaf & 0xFF <= 5] += 1
+            b += u[3]
     failed = 0
     for name, c in res.items():
         if c:

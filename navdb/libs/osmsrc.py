@@ -5,9 +5,9 @@ deduplicated by OSM id).
 A region is downloaded to temp/osm/<name>-latest.osm.pbf and converted with ogr2ogr to
 temp/osm/<name>.gpkg (layers lines, points, multipolygons). The files are a cache: an extract
 older than ASK_DAYS is downloaded again if the user says so (asked on a terminal), one older
-than MAX_DAYS always. The region's boundary
-(<name>.poly) gives the encoded area: the extract's own extent is larger (whole ways crossing the
-border, ferry lines to Scandinavia).
+than MAX_DAYS always. The encoded area comes from the countries' boundaries in the extracts
+(libs/osmplaces.Borders): an extract's own extent is larger (whole ways crossing the border,
+ferry lines to Scandinavia).
 """
 import shutil
 import sqlite3
@@ -19,13 +19,16 @@ from pathlib import Path
 
 GEOFABRIK = "https://download.geofabrik.de/"
 ASK_DAYS, MAX_DAYS = 7, 30
-REGIONS = {
+REGIONS = {               # extract name (cache file name) -> Geofabrik path
     "polska": "europe/poland",
-    **{v: f"europe/poland/{v}" for v in (
-        "dolnoslaskie", "kujawsko-pomorskie", "lodzkie", "lubelskie", "lubuskie", "malopolskie",
-        "mazowieckie", "opolskie", "podkarpackie", "podlaskie", "pomorskie", "slaskie",
-        "swietokrzyskie", "warminsko-mazurskie", "wielkopolskie", "zachodniopomorskie")},   # countries.VOIVODESHIPS
+    "slovenia": "europe/slovenia",
+    "croatia": "europe/croatia",
+    "bosnia-herzegovina": "europe/bosnia-herzegovina",
+    "montenegro": "europe/montenegro",
     "serbia": "europe/serbia",
+    "kosovo": "europe/kosovo",
+    "macedonia": "europe/macedonia",
+    "albania": "europe/albania",
 }
 
 
@@ -79,9 +82,6 @@ def fetch(name, folder, log=print):
     if fresh:
         log(f"downloading {GEOFABRIK}{REGIONS[name]}-latest.osm.pbf")
         _download(f"{GEOFABRIK}{REGIONS[name]}-latest.osm.pbf", pbf, log)
-    poly = folder / f"{name}.poly"
-    if fresh or not poly.is_file():
-        _download(f"{GEOFABRIK}{REGIONS[name]}.poly", poly, log)
     if not gpkg.is_file() or gpkg.stat().st_mtime < pbf.stat().st_mtime:
         if not shutil.which("ogr2ogr"):
             raise SystemExit("ogr2ogr (GDAL) is needed to read OSM files; install gdal")
@@ -92,35 +92,6 @@ def fetch(name, folder, log=print):
                         "-gt", "65536"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tmp.rename(gpkg)
     return gpkg
-
-
-def _poly_box(path):
-    """Box of an osmosis .poly file (lines of "lon lat" between section names and END)."""
-    xs, ys = [], []
-    for line in path.read_text().splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            try:
-                x, y = float(parts[0]), float(parts[1])
-            except ValueError:
-                continue
-            xs.append(x)
-            ys.append(y)
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def extent(gpkgs):
-    """Union of the regions' boxes (lon0, lat0, lon1, lat1): from <name>.poly next to the
-    GeoPackage, else the extent of its lines layer."""
-    boxes = []
-    for g in gpkgs:
-        poly = Path(g).with_suffix(".poly")
-        if poly.is_file():
-            boxes.append(_poly_box(poly))
-            continue
-        db = sqlite3.connect(g)
-        boxes.append(db.execute("SELECT min(minx), min(miny), max(maxx), max(maxy) FROM rtree_lines_geom").fetchone())
-    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
 def rows(gpkgs, sql, params=()):
@@ -137,3 +108,20 @@ def rows(gpkgs, sql, params=()):
                     continue
                 seen.add(row[0])
             yield row
+
+
+STRIPES = 32           # fixed, so the output does not depend on the number of workers
+
+
+def prows(gpkgs, sql, params, func):
+    """func(rows) for vertical stripes of the query (by the feature's minx, so no feature is in
+    two stripes) in worker processes; the lists func returns, joined in stripe order. sql uses
+    the alias r for the R-tree and ends with a condition."""
+    from .par import pmap
+    x0, x1 = params[0], params[1]          # bbox lon0 / lon1 come first (r.maxx >= ?, r.minx <= ?)
+    xs = [x0 + (x1 - x0) * i / STRIPES for i in range(STRIPES + 1)]
+    xs[0], xs[-1] = -1e9, 1e9
+    jobs = list(zip(xs, xs[1:]))
+    part = lambda st: func(rows(gpkgs, sql + " AND r.minx >= ? AND r.minx < ?", tuple(params) + st))
+    return [x for out in pmap(part, jobs, 2) for x in out]
+

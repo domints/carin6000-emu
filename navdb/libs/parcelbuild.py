@@ -20,7 +20,9 @@ ORIGIN = (-34998272, -59092992)    # grid origin of every index (block 2 directo
 EXTENT = 1 << 29
 MIN_SIZE = 1 << 15                 # smallest parcel side in the original (32768 units)
 MAX_SIZE = 1 << 21                 # largest level 0 parcel side (points are u16 steps of 64)
-MAX_BYTES = 12000                  # estimated parcel size limit (units are at most 8 blocks)
+MAX_BYTES = 17000                  # estimated level 0 parcel size limit: about 15 KB unpacked (the
+                                   # estimate is high by 1.1-1.3x), the original goes to 15.9 KB
+MAX_UPPER_BYTES = 12000            # levels 1-3 (the original: at most 11.8 KB)
 SEG = 32                           # level 0 segment record (type 0x08)
 
 
@@ -60,7 +62,11 @@ def tile(edges, bbox_gps):
     split while the estimated parcel size exceeds MAX_BYTES."""
     root = aligned_root(bbox_gps)
     ax, ay, size = root.x, root.y, root.size
-    load = [(e.points(), 48 + 6 * len(e.shape) + 2 * len(e.road.name or "")) for e in edges]
+    load = []
+    for e in edges:
+        pts = e.points()
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        load.append(((min(xs), min(ys), max(xs), max(ys)), 48 + 6 * len(e.shape) + 2 * len(e.road.name or "")))
 
     def split(box, items):
         if box.size > MAX_SIZE or (box.size > MIN_SIZE and sum(c for _, c in items) > MAX_BYTES):
@@ -69,7 +75,8 @@ def tile(edges, bbox_gps):
             for dx in (0, h):
                 for dy in (0, h):
                     b = Box(box.x + dx, box.y + dy, h)
-                    sub = [(pts, c) for pts, c in items if _touches(b, pts)]
+                    x0, y0, x1, y1 = b.x, b.y, b.x + h, b.y + h
+                    sub = [(bb, c) for bb, c in items if bb[0] < x1 and bb[2] >= x0 and bb[1] < y1 and bb[3] >= y0]
                     leaves += split(b, sub)
             return leaves
         return [box] if items else []
@@ -109,6 +116,8 @@ class Piece:
     length: int
     border: tuple = (False, False)     # start / end is an edge point
     hn: tuple = None                   # house numbers (osmaddr.assign)
+    h0: int = None                     # heading at the start / end node from level 0 geometry
+    h1: int = None                     # (None: from the points; edge points always so)
 
 
 @dataclass(eq=False, slots=True)
@@ -123,6 +132,7 @@ class Parcel:
     offsets: dict = field(default_factory=dict)      # point -> offset of its record (after layout)
     seg_base: int = 0                                # offset of slot 4 (after layout)
     turns: dict = None                               # prohibited turns (osmturns.assign)
+    order: list = None                               # sorted_pieces() cache
 
 
 def _nudge(p, box):
@@ -171,10 +181,14 @@ def nudge_edges(edges, leaves):
         e.a, e.b, e.shape = inside(e.a), inside(e.b), [inside(p) for p in e.shape]
 
 
-def clip(edges, leaves):
+def clip(edges, leaves, fixed=frozenset(), record=False):
     """Parcels with the edge pieces inside them. Every line segment is split where it crosses a
     parcel border line, each part goes to the parcel holding its middle, and where the parcel
-    changes the crossing point becomes an edge point pair (on the grid, unique per parcel)."""
+    changes the crossing point becomes an edge point pair (on the grid, unique per parcel).
+    record: the cut points are put into the edges' shapes (level 0, so that the levels above,
+    whose borders are level 0 borders, cut at the same points: the router goes down a level by
+    the point and its heading). fixed: such points, used as they are where a border runs through
+    them."""
     import bisect
     grid = Grid(leaves)
     parcels = {id(b): Parcel(b) for b in leaves}
@@ -206,7 +220,7 @@ def clip(edges, leaves):
             lo, hi = max(a.x, b.x) + POINT_STEP, min(a.x + a.size, b.x + b.size) - POINT_STEP
             pt, axis = [min(max(round(x / POINT_STEP) * POINT_STEP, lo), hi), by], 0
         k = 0
-        while (id(a), tuple(pt)) in used or (id(b), tuple(pt)) in used or tuple(pt) in vertices:
+        while (id(a), tuple(pt)) in used or (id(b), tuple(pt)) in used or (tuple(pt) in vertices and tuple(pt) not in fixed):
             k += 1
             pt[axis] += POINT_STEP * k * (-1) ** k
             if not lo <= pt[axis] <= hi:
@@ -215,6 +229,8 @@ def clip(edges, leaves):
 
     for e in edges:
         pts = e.points()
+        geo = sum(metres(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
+        scale = e.length / geo if e.length and geo else 1.0
         parts = []                               # (point, leaf of the part ending at point)
         for i in range(len(pts) - 1):
             p, q = pts[i], pts[i + 1]
@@ -222,15 +238,18 @@ def clip(edges, leaves):
             for k in range(len(ts) - 1):
                 a = (p[0] + ts[k] * (q[0] - p[0]), p[1] + ts[k] * (q[1] - p[1]))
                 b = (p[0] + ts[k + 1] * (q[0] - p[0]), p[1] + ts[k + 1] * (q[1] - p[1]))
-                parts.append((p, q, ts[k + 1], leaf_at(a, b), k + 1 == len(ts) - 1))
+                parts.append((p, q, ts[k + 1], leaf_at(a, b), k + 1 == len(ts) - 1, i))
         cur = parts[0][3] if parts else None
+        cuts = []                                # (segment index, cut point)
+        acc, marks = 0, {}                       # level 0 lengths so far, at each cut point
         piece, start_border = [pts[0]], False
-        for n, (p, q, t, leaf, at_vertex) in enumerate(parts):
+        for n, (p, q, t, leaf, at_vertex, _) in enumerate(parts):
             if leaf is None:
                 cur, piece = None, None
                 continue
             if cur is None:                      # coming back into the tiled area: start over
                 cur, piece, start_border = leaf, [q if at_vertex else p], False
+                marks = None
                 continue
             if leaf is not cur:
                 # the previous part ended on a border between cur and leaf
@@ -238,14 +257,19 @@ def clip(edges, leaves):
                 c = cut_point(pp, pq, pt_t, cur, leaf) if _adjacent(cur, leaf) else None
                 if c is None:                    # corner or no shared border: drop this piece
                     cur, piece, start_border = leaf, [q if at_vertex else p], False
+                    marks = None
                     continue
                 if piece[-1] != c:
                     piece.append(c)
+                if record and c != pp and c != pq:
+                    cuts.append((parts[n - 1][5], c))
                 if len(piece) >= 2:
                     pa, pb = parcels[id(cur)], parcels[id(leaf)]
                     used.add((id(cur), c))
                     used.add((id(leaf), c))
-                    _emit(pa, piece, e.road, (start_border, True))
+                    acc += _emit(pa, piece, e.road, (start_border, True), e, scale)
+                    if marks is not None:        # None: a piece was dropped, the edge goes up unmarked
+                        marks[c] = acc
                     pa.borders[c], pb.borders[c] = pb, pa
                     cur, piece, start_border = leaf, [c], True
                 else:
@@ -253,7 +277,18 @@ def clip(edges, leaves):
             if at_vertex and piece[-1] != q:
                 piece.append(q)
         if cur is not None and piece and len(piece) >= 2:
-            _emit(parcels[id(cur)], piece, e.road, (start_border, False))
+            acc += _emit(parcels[id(cur)], piece, e.road, (start_border, False), e, scale)
+        else:
+            marks = None
+        if record and marks is not None:         # the levels above add up the same lengths
+            e.marks, e.length = marks, acc
+        if cuts:
+            e.h0, e.h1 = edge_headings(e)        # the node headings stay those of the old shape
+            shape = []
+            for i, p in enumerate(pts[1:], 1):
+                shape += [c for k, c in cuts if k == i - 1]
+                shape.append(p)
+            e.shape = shape[:-1]
     # a border pair needs a piece ending at the point on both sides (a side may have been dropped)
     ends = {id(pc): {p for piece in pc.pieces for p in (piece.points[0], piece.points[-1])}
             for pc in parcels.values()}
@@ -274,9 +309,35 @@ def _adjacent(a, b):
     return (touch_x and overlap_y) or (touch_y and overlap_x)
 
 
-def _emit(parcel, pts, road, border):
-    length = sum(metres(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
-    parcel.pieces.append(Piece(pts, road, max(1, round(length)), border))
+def edge_headings(e):
+    """Headings at the edge's start and end node (+14 / +15): from its own first and last line
+    segment, or carried over from level 0 (levels.join)."""
+    pts = e.points()
+    return (e.h0 if e.h0 is not None else heading(pts[0], pts[1]),
+            e.h1 if e.h1 is not None else heading(pts[-1], pts[-2]))
+
+
+def piece_headings(pc):
+    pts = pc.points
+    return (pc.h0 if pc.h0 is not None else heading(pts[0], pts[1]),
+            pc.h1 if pc.h1 is not None else heading(pts[-1], pts[-2]))
+
+
+def _emit(parcel, pts, road, border, e, scale):
+    """A piece of edge e; a piece starting / ending at e's node keeps e's heading there, and its
+    length is its share of e's length (upper levels: the level 0 length, not the simplified one;
+    between points of e.marks exactly the sum of the level 0 pieces, as on the original)."""
+    length = max(1, round(sum(metres(pts[k], pts[k + 1]) for k in range(len(pts) - 1)) * scale))
+    if e.marks is not None:
+        s = 0 if pts[0] == e.a and not border[0] else e.marks.get(pts[0])
+        t = e.length if pts[-1] == e.b and not border[1] else e.marks.get(pts[-1])
+        if s is not None and t is not None and t > s:
+            length = t - s
+    h0, h1 = edge_headings(e)
+    parcel.pieces.append(Piece(pts, road, length, border,
+                               h0=h0 if pts[0] == e.a and not border[0] else None,
+                               h1=h1 if pts[-1] == e.b and not border[1] else None))
+    return length
 
 
 def segment_defaults(road):
@@ -307,8 +368,10 @@ class Strings:
 
 def sorted_pieces(parcel):
     """Segment order in the parcel (by class, as the class index needs), shared with the house
-    number unit."""
-    return sorted(parcel.pieces, key=lambda p: (p.road.cls, p.road.name or "", p.points[0]))
+    number unit; kept on the parcel while its pieces stay the same."""
+    if parcel.order is None or len(parcel.order) != len(parcel.pieces):
+        parcel.order = sorted(parcel.pieces, key=lambda p: (p.road.cls, p.road.name or "", p.points[0]))
+    return parcel.order
 
 
 def node_type(degree):
@@ -316,7 +379,7 @@ def node_type(degree):
 
 
 def build_level0(parcel, ctx):
-    """RawParcel of a level 0 parcel. ctx: country (name, number), city_of(road) -> (city,
+    """RawParcel of a level 0 parcel. ctx: country_of(road) -> (name, number), city_of(road) -> (city,
     municipality), district_of(road) -> text or None, code(point) -> node byte bits 6-7 (3 - top
     level), ptr(parcel) -> unit pointer, hn_ptr(parcel) -> house number unit pointer or 0."""
     from . import parcelfmt
@@ -334,22 +397,24 @@ def build_level0(parcel, ctx):
 
     # places
     strings = Strings()
-    country, number = ctx.country
-    cities = {}
-    streets = {}
+    countries, cities, streets = {}, {}, {}           # a parcel at a border holds two countries
     for pc in pieces:
+        country = ctx.country_of(pc.road)
         city, muni = ctx.city_of(pc.road)
-        cities[(city, muni)] = None
-        streets[(pc.road.name, ctx.district_of(pc.road), city, muni)] = None
-    city_list = sorted(cities, key=lambda c: (c[0] or "", c[1] or ""))
-    street_list = sorted(streets, key=lambda s: (s[0] or "", s[1] or "", s[2] or ""))
-    for t in [country] + [c for cm in city_list for c in cm] + [x for st in street_list for x in st[:2]]:
+        countries[country] = None
+        cities[(city, muni, country)] = None
+        streets[(pc.road.name, ctx.district_of(pc.road), city, muni, country)] = None
+    country_list = sorted(countries) or [ctx.country_of(None)]
+    city_list = sorted(cities, key=lambda c: (c[0] or "", c[1] or "", c[2]))
+    street_list = sorted(streets, key=lambda s: (s[0] or "", s[1] or "", s[2] or "", s[4]))
+    for t in [c[0] for c in country_list] + [c for cm in city_list for c in cm[:2]] + \
+            [x for st in street_list for x in st[:2]]:
         strings.add(t)
 
     # sizes and offsets (memory order 0-7, 9, 8, 10-12, text)
     def a4(n):
         return (n + 3) & ~3
-    n0, n1, n2 = 3, len(city_list) + 2, len(street_list) + 2
+    n0, n1, n2 = len(country_list) + 2, len(city_list) + 2, len(street_list) + 2
     o0 = parcelfmt.HEADER
     o1 = a4(o0 + 10 * n0)
     o2 = a4(o1 + 10 * n1)
@@ -373,17 +438,20 @@ def build_level0(parcel, ctx):
     parcel.offsets = node_off
     seg_off = [o4 + SEG * i for i in range(len(pieces))]
     parcel.seg_base = o4
+    country_rec = {c: o0 + 10 * (k + 1) for k, c in enumerate(country_list)}
     city_rec = {c: o1 + 10 * (k + 1) for k, c in enumerate(city_list)}
     street_rec = {st: o2 + 10 * (k + 1) for k, st in enumerate(street_list)}
 
     def place(off, name, second, parent):
         return struct.pack(">HHHHH", strings[name], second, parent, 0, 0)
 
-    r0 = bytes(10) + struct.pack(">HHHHH", strings[country], number, 0, 0, 0) + bytes(10)
+    r0 = bytes(10) + b"".join(struct.pack(">HHHHH", strings[name], number, 0, 0, 0)
+                              for name, number in country_list) + bytes(10)
     r1 = place(0, None, 0, o0) + b"".join(
-        place(0, c, strings[m], o0 + 10) for c, m in city_list) + place(0, None, 0, o0 + 20)
+        place(0, c, strings[m], country_rec[cn]) for c, m, cn in city_list) + place(0, None, 0, o0 + 10 * (n0 - 1))
     r2 = place(0, None, 0, o1) + b"".join(
-        place(0, s[0], strings[s[1]], city_rec[(s[2], s[3])]) for s in street_list) +         place(0, None, 0, o1 + 10 * (n1 - 1))
+        place(0, s[0], strings[s[1]], city_rec[(s[2], s[3], s[4])]) for s in street_list) + \
+        place(0, None, 0, o1 + 10 * (n1 - 1))
 
     # class index
     r3 = b""
@@ -412,11 +480,11 @@ def build_level0(parcel, ctx):
         r4 += struct.pack(">HHHHHBBHBBBBHHHHHHH",
                           node_off[pts[0]], node_off[pts[-1]], shape_pos,
                           ring[(i, 0)], ring[(i, 2)],
-                          (rd.paved << 7) | speed, (b6 << 6) | (rd.oneway << 4) | rd.fow,
-                          min(pc.length, 0xFFFF), heading(pts[0], pts[1]), heading(pts[-1], pts[-2]),
+                          (rd.paved << 7) | speed, (rd.toll << 6) | (rd.oneway << 4) | rd.fow,
+                          min(pc.length, 0xFFFF), *piece_headings(pc),
                           (b7 << 7) | (rd.kind << 4) | rd.cls, b17,
                           turn_pos, o12, 0, 0,
-                          street_rec[(rd.name, ctx.district_of(rd)) + tuple(ctx.city_of(rd))], w28, o11)
+                          street_rec[(rd.name, ctx.district_of(rd), *ctx.city_of(rd), ctx.country_of(rd))], w28, o11)
         for q in pts[1:-1]:
             r7 += struct.pack(">HHBB", (q[0] - box.x) // POINT_STEP, (q[1] - box.y) // POINT_STEP, 0, 0)
             shape_pos += 6

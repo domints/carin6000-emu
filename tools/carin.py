@@ -29,6 +29,9 @@ CD_NAME = "carin_nav_sw"
 STATE_ROOT = ROOT / "state"
 LOG_ROOT = ROOT / "logs"
 MAME_CFG_DIR = STATE_ROOT / "_mame_cfg"
+# OpenStreetMap tiles behind the car simulator (plugin carsim), at most 1 GB.
+TILE_DIR = ROOT / "temp" / "osm_tiles"
+TILE_CACHE_LIMIT = 1 << 30
 # Hardware variant -> MAME system. The NAV_SW disc carries software for both (Mk2IC/0109, Mk2IC/0209);
 # the variant is remembered in state/<name>/hw.
 SYSTEMS = {"0209": "carin", "0109": "carin0109"}
@@ -194,7 +197,12 @@ def ram_options(args):
 
 
 def speed_options(args):
-    """Full speed by default; --realtime throttles to the real machine's speed."""
+    """Full speed by default; --realtime throttles to the real machine's speed, --speed X to X
+    times that (MAME -speed)."""
+    if args.speed is not None:
+        if not 0.01 <= args.speed <= 100:
+            sys.exit("--speed must be between 0.01 and 100")
+        return ["-speed", f"{args.speed:g}"]
     return [] if args.realtime else ["-nothrottle"]
 
 
@@ -273,24 +281,53 @@ def cmd_run(args):
             print(line[:200])
 
 
+def trim_tile_cache():
+    """The car window's OpenStreetMap tile cache (TILE_DIR, plugin carsim) stays under
+    TILE_CACHE_LIMIT: the tiles not used for the longest time go first."""
+    stats = [(p, p.stat()) for p in TILE_DIR.rglob("*.png")]
+    files = [(max(s.st_atime, s.st_mtime), s.st_size, p) for p, s in stats]
+    total = sum(size for _, size, _ in files)
+    for _, size, path in sorted(files):
+        if total <= TILE_CACHE_LIMIT:
+            break
+        path.unlink(missing_ok=True)
+        total -= size
+
+
 def cmd_gui(args):
     if args.build:
         build(args.jobs)
     check_binary()
     state = prepare_state(args)
     log_dir = new_log_dir("gui", state)
-    # One window (layout carin.lay): navigation video, the clickable front panel and the OS-9
-    # console on terminal A. Port B only goes to uart_b.txt.
+    # One window (layout carin.lay): navigation video, the clickable front panel, the OS-9 console
+    # on terminal A and, on the right, the car simulator (plugin carsim, mame/plugins/carsim).
+    # Port B only goes to uart_b.txt.
     cmd = mame_command(state, log_dir, cd_image(args), args.system)
     # -ui_active: the console has an emulated keyboard, which would otherwise take every key
     # (Tab included) until the UI toggle key (Scroll Lock) is pressed.
-    cmd += ["-window", "-nomaximize", "-view", "Navigation, panel and console", "-ui_active"]
+    cmd += ["-window", "-nomaximize", "-ui_active"]
+    env = trace_env(args)
+    for key in ("CARIN_CAR_AT", "CARIN_TILE_DIR", "CARIN_TILES"):
+        env.pop(key, None)
+    if args.no_car:
+        cmd += ["-view", "Navigation, panel and console"]
+    else:
+        cmd += ["-view", "Navigation, panel, console and car", "-resolution", "1440x598", "-plugin", "carsim"]
+        if args.car_at:
+            env["CARIN_CAR_AT"] = args.car_at
+        if args.no_tiles:
+            env["CARIN_TILES"] = "0"
+        else:
+            TILE_DIR.mkdir(parents=True, exist_ok=True)
+            env["CARIN_TILE_DIR"] = str(TILE_DIR)
+            trim_tile_cache()
     cmd += ram_options(args) + speed_options(args)
     if args.debug:
         cmd += ["-debug"]
     cmd += args.mame_args
     with open(log_dir / "mame.log", "w") as out:
-        proc = subprocess.Popen(cmd, cwd=log_dir, env=trace_env(args), stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=log_dir, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace")
         for line in proc.stdout:
             sys.stdout.write(line)
@@ -338,8 +375,11 @@ def add_state_options(p):
     t.add_argument("--trace", metavar="CHANNELS",
                    help="'off', or a comma list of channels (ipc,mailbox,mcasic,arcnet,duart,nv,irq,cdrom,video)")
     t.add_argument("--trace-cap", type=int, metavar="BYTES", help="size cap of each trace file")
-    p.add_argument("--realtime", action="store_true",
+    s = p.add_mutually_exclusive_group()
+    s.add_argument("--realtime", action="store_true",
                    help="run at the real machine's speed (default: as fast as possible, -nothrottle)")
+    s.add_argument("--speed", type=float, metavar="X",
+                   help="run at X times the real machine's speed, e.g. 2 or 0.5 (1 = --realtime)")
     p.add_argument("-b", "--build", action="store_true", help="build MAME first")
     p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2, help="build jobs")
     p.add_argument("mame_args", nargs="*", help="extra MAME options (after --)")
@@ -370,6 +410,9 @@ def main():
     p = sub.add_parser("gui", help="windowed run in real time")
     add_state_options(p)
     p.add_argument("--debug", action="store_true", help="open the MAME debugger")
+    p.add_argument("--no-car", action="store_true", help="no car simulator window")
+    p.add_argument("--car-at", metavar="LAT,LON", help="move the simulated car here at start (degrees)")
+    p.add_argument("--no-tiles", action="store_true", help="no OpenStreetMap tiles behind the car")
     p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("chd", help="make cd/NAME.chd from cd/NAME.cue (+ .img)")

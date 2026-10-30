@@ -1,0 +1,10 @@
+{
+	"plugin": {
+		"name": "carsim",
+		"description": "CARiN car simulator window",
+		"version": "0.1",
+		"author": "carin6000-emu",
+		"type": "plugin",
+		"start": "false"
+	}
+}

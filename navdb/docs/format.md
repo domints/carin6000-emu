@@ -229,7 +229,7 @@ after pbp's second pass, slot 14 on levels 1-3).
 | 5 | 0x10 (8 B) | **nodes**: x, y, +4 a segment at the node (entry into its ring), +6 node byte, +7 0 |
 | 6 | 0x06 (16 B) | **edge points** (on the parcel border): x, y, +4 segment, +6 node byte, +7 0, +8 u32 **neighbour parcel**, +12 offset of the same point's edge record there, +14 0 (**checked**: reciprocal) |
 | 7 | 0x0c (6 B) | **shape points**: x, y, 0, 0; a segment's shape runs from its +4 to the next segment's +4, start → end (**confirmed** dbq `FUN_000149ba`) |
-| 8 | 4 B | levels 1-3: **child grid**: n × n pointers to parcels of the level below, column-major, cell = word 0x5c = the smallest child, at least box / 16; each = the child holding the cell centre, 0 = none |
+| 8 | 4 B | levels 1-3: **child grid**: n × n pointers to parcels of the level below, column-major, cell = word 0x5c = the smallest child, at least box / 16; each = the child holding the cell centre, 0 = none. **Checked** on the original: no child is smaller than a cell (n ≤ 16), so every node is found in the child at its cell (the router goes down by the grid); the encoder splits an upper parcel until its smallest child is ≥ box / 16 |
 | 9 | 0x0f (8 B) | **neighbour parcels**: u32 pointer, u16 x, u16 y (a point on the shared border, 64-unit steps) |
 | 10 | 0x14 (8 B) | **prohibited turns** (**confirmed** rpmod `FUN_0000bb24`): u32 parcel of the target, u16 target segment, u16 flags; bit 0 = direction on the source (0 = end → start, via its start node; 1 = start → end, via its end node); bit 1 *unused*. A segment's entries run from its +18 to the next segment's +18; the router keeps 8 per direction |
 | 11 | 0x13 (6 B) | **signposts** (guidance only): text (destination "krakow"), text (route "e77"), u16 direction; from the segment's +30 |
@@ -277,6 +277,29 @@ their own level.
   level L path between them (**checked**: same length). Up: parent pointer + same coordinates;
   down: the child grid. The router searches level 0 near start and destination until it reaches
   nodes that go up, continues on the coarse levels and comes down again.
+- **Going up matches segments by heading** (**confirmed** rpmod `FUN_000169c4` → `FUN_000165cc`
+  → `FUN_00015fc8` / `FUN_000160d8`): the router loads the parent (+0x58), finds the node with the
+  same coordinates (slot 5, then slot 6) and walks its ring for the segment whose heading at the
+  node (+14 at its start, +15 at its end) **equals** the heading of the segment it came along;
+  none = error 0x19b and the route is not found. So an upper level segment keeps the level 0
+  headings at its nodes, also when its shape is simplified (**checked** on the original: every
+  class ≤ 2 / ≤ 1 / 0 heading at a node that goes up exists in the parent; `tests/check_db.py`).
+  The encoder's first discs broke this (headings from the simplified shape): the router went up
+  to level 1, failed and started over.
+- **Going down is the same match the other way** (**checked** on the original: every node and
+  edge point of a level 1-3 parcel exists in the child at its grid cell, with the headings of its
+  segments there; `tests/check_db.py`). After the search the route is expanded to level 0 along
+  the coarse segments (the device reads the level 0 parcels along the whole route). So an upper
+  level **edge point** is a level 0 edge point (same position) and keeps the level 0 headings:
+  the encoder cuts the upper levels at the level 0 cut points and keeps them and their
+  neighbouring shape points when simplifying, and gives every upper segment exactly the sum of
+  the level 0 segment lengths it stands for (on the original 370 of 371 in Warsaw; a 1-2 m
+  rounding difference in 7 % of the segments still stopped the expansion at the Siekierkowski
+  bridge). Discs before 2026-10-28 cut the simplified shape
+  instead: the route ended at the first level 1 parcel border (the device found no level 0
+  point there and drew the route only up to it).
+- Segment +11 bit 6 only adds a cost (`FUN_0000b622`: + 0x100 × the segment's cost factor), most
+  likely a toll flag; never set in Poland on the original.
 
 ### Router cost model (rpmod)
 
@@ -334,8 +357,35 @@ slot has offset 0.
 
 **Area types**: 1 water, 3 forest / park, 5 built-up (named after the town on coarse levels), 6
 cemetery, 8 land / island. **Line types** (**checked**): 101 rivers and canals, 102 railways
-(level 0), 103 probably borders (levels 3-5), 104 main roads (A, S, main national), 105 other
-national roads, 106 voivodeship roads. The original drops 106 above level 1 and 105 above level 2.
+(level 0), 103 probably borders (levels 3-5), 104 / 105 / 106 = roads of routing class 0 / 1 / 2
+(**checked**: every original level 0 line over Warsaw lies on segments of that class; no class 3).
+The original drops 106 above level 1 and 105 above level 2. The device does not draw every type at
+every zoom: with class 2 as 105 (discs before 2026-10-28) Marszałkowska vanished at the 1 km scale
+while its side streets (class 3 as 106) showed.
+
+What the original shows per level (around Warsaw): levels 0-1 built-up areas named after the
+village / town (one area per place), forests, water, rivers of some length; level 2 towns,
+few forests, long rivers; levels 3-4 only towns, big water, rivers like the Vistula, main roads
+and borders (103); level 5 the biggest towns and borders. The encoder follows this: landuse
+built-up on levels 0-1 (the largest area of each village / town district named), towns from
+level 1, forests up to 2, cemeteries up to 1, rivers by length (named from 20 km, levels 3-4
+from 150 km). **The map draws its roads from the background on every level** (seen on the device:
+without background roads 10-20 km showed no roads, a full unit a square without roads), so roads
+come first: a unit that gets too full drops the rest first, then roads 106 and areas of ≥ 5 × the
+level's smallest area, then roads 105, big water (≥ 20 ×) and named rivers, main roads (104) and
+big towns last; before dropping, a full unit is simplified at 2× and 4× the level's tolerance
+(dropping cut roads at their junctions: the short pieces go first). Roads per level as the
+original: classes ≤ 2 on levels 0-1, ≤ 1 on 2, 0 on 3-4; no slip roads; one line per road (an edge running along roads already taken, within 25 /
+60 / 150 / 400 / 1000 m, is left out: the other carriageway, parallel roads), merged end to end.
+
+Units: levels 0-2 split while too big down to 2^18 (smaller units than the original's draw fine;
+the device's RAM does not limit them), levels 3-5 have one size (2^24-2^26) and only drop shapes.
+**At most ~500 units per spatial index cell** (2^24 on levels 0-2 at N 32): the cell's kind 9 unit then
+stays within 5 blocks (the original's largest). A disc with ~1000 small level 0 units under Warsaw
+had kind 9 units of 6-9 blocks; the device read that index and never read a level 0 unit (no
+background at 500 m / 1 km). Where a cell would get more, its units are made larger and drop shapes.
+The encoder's background indexes use N = 128 (cell 2^22, at most 256 units of 2^18), the original
+32; N is free per table (the original: 512, 256, 32, 8, 1; the kind 8 unit holds the cell size).
 
 ## 7. POI (tables 7, 11, 12)
 
@@ -408,9 +458,15 @@ u16 offset of the category's brand list (slot 5: 12 B, table 12 unit / offset / 
 **Country numbers** index the firmware's **country table** (NAV_SW disc; number − 1 = record,
 6-byte records: u8 index, 5-byte car registration code, the code the menus show): an
 alphabetical English list of 240 countries (1 AFG, 33 BG, 53 HR, 56 CZ, 81 D, 97 H, 171 PL, 176
-RO, 188 WAL, 190 SK, 191 SLO, 237 YU, 240 ZW; gaps have no code). Without a map the menus show
-D (81). The country name comes from the disc. Serbia has no code of its own: the encoder uses
-237 YU, with Croatia's record constants, settings and language byte.
+RO, 188 WAL, 190 SK, 191 SLO, 237 YU, 240 ZW; gaps have no code; full list in
+[country_table.md](country_table.md)). Without a map the menus show
+D (81). The country name comes from the disc. The encoder gives every country a number of its
+own, as the firmware may pick a country by number alone (e.g. one kept in NV): the real one where
+the table has it (si 191 SLO, hr 53 HR, ba 27 BHI, mk 126 MK, al 2 AL), Serbia 237 YU, Montenegro
+235 and Kosovo 236 (unused entries without a code: Western Sahara, Yemen). Block 2 slot 2 holds
+one 22-byte settings record per number, sorted by number (hr and si have identical settings on
+the original; the original's slot has room for 11). *Open*: what the menus show for a number
+without a code (check on the device).
 
 `tests/check_search.py` walks the chain like the device (the original passes 92-99.9 %: names in
 other languages; the encoder output 100 %).
@@ -438,14 +494,20 @@ What `navdb/encoder.py` does, as rules any writer must follow:
    and zero name tables; background units with zero name tables. Level 0 parcels are then
    compressed (`libs/pack.py`, the inverse of pbp; about 2x), everything else stays uncompressed.
 2. **Parcels** on a quadtree aligned to the index grid, at most 8 blocks each. A road becomes
-   segments between nodes (junctions, attribute changes, parcel borders); bends are shape points.
+   segments between nodes (junctions, attribute changes, parcel borders); bends are shape points,
+   simplified at 2 m (about the original's 1.35 points per segment; lengths stay those of the full
+   shape). Parcels are filled close to the original's size (level 0 up to about 15 KB unpacked, the
+   original's median is 10 KB): the device routes and draws through few large parcels.
    Roads crossing a parcel border are cut; the cut point is an edge point pair (never at a corner,
    never on another vertex, one per pair of parcels). Segments sorted by class, nodes by best
    class, class index, node rings, node bytes, neighbour list.
 3. **Levels 1-3**: roads of class ≤ 2 / ≤ 1 / 0, chains through degree-2 nodes joined into one
-   segment (length = sum; loops cut in two), shapes simplified; a node kept on a level is kept on
+   segment (length = sum; loops cut in two), shapes simplified (keeping the level 0 edge points
+   and their neighbours: upper edge points are level 0 ones); a node kept on a level is kept on
    every level below, node byte c = 3 − its top level; parcels are quadtree ancestors of the level
-   below (≥ 2^18 for levels 1-2, ≥ 2^20 for level 3, ≤ 2^21), parent pointers and child grids.
+   below (≥ 2^18 for levels 1-2, ≥ 2^20 for level 3, ≤ 2^21; level 1 down to 2^17 where a 2^18
+   parcel would not fit in 8 blocks, e.g. Belgrade with 409 segments, and then table 1e's index
+   grid is 64 instead of 32 so a subcell stays ≥ 1/64 of a cell), parent pointers and child grids.
    Level 0 header 0x60-0x68 = mean travel time to each level's network.
 4. **House number units** per parcel with numbers (0x54, byte 0x70).
 5. **Background**: only for the encoded area, 6 levels with the original unit sizes, groups in
@@ -453,8 +515,15 @@ What `navdb/encoder.py` does, as rules any writer must follow:
    background table gets at least one unit.
 6. **Search**: country, cities (gminas + settlements), streets with rotations, tries whose
    leaves stay inside one name unit, linked lists, city destinations; block 0 0x0c / 0x44 = the
-   country trie root count; block 2 slot 2 = only our country (settings of its template country).
+   country trie root count; block 2 slot 2 = only our countries' numbers (settings of their
+   template countries). Several countries per disc: block 4 rows and records sorted by name,
+   block 3 one leaf per first letter (as the original), a city trie per country in shared
+   e / d / 10 / f tables; a parcel at a border lists both countries in slot 0.
    Trie leaves are split by size too (big cities' street lists).
+   **Prohibited turns** (slot 10) from OSM restriction relations via a node, read from the .osm.pbf
+   (`libs/osmturns.py`): no_* = that turn, only_* = every other turn at the node; the target is a
+   segment of the same parcel (offset), bit 0 = the source's direction (1 = its end is the via
+   node). The original passes the same check in 93 % of its parcels.
 7. **POI** (basic set): table 7 points in quadtree tiles (≤ 2^21, ≤ 400 points), table 11 lists
    per (gmina, category) with one access segment each (the nearest road, motorways avoided),
    table 12 tries; city records list their categories, the country record airports and museums;
@@ -468,8 +537,9 @@ Verification: `tests/check_db.py` (structure rules; the original passes them too
 `tests/check_search.py` (the address search chain), `tests/compare_osm.py` (road lengths per
 attribute group against OSM), decoding with `decoder.py`, and finally the device / emulator.
 
-**OSM mapping** (`libs/osmnet.py`, `osmplaces.py`, `osmaddr.py`, `osmbg.py`, `osmpoi.py`; one
-country per disc, `libs/countries.py`):
+**OSM mapping** (`libs/osmnet.py`, `osmplaces.py`, `osmaddr.py`, `osmbg.py`, `osmpoi.py`;
+packages of countries, `libs/countries.py`; a road, POI or place belongs to the country whose
+admin_level 2 boundary holds it, the rest is left out):
 
 | OSM | CARiN |
 |---|---|
@@ -480,9 +550,10 @@ country per disc, `libs/countries.py`):
 | name (Poland: + "ulica " unless it starts with a street word), ref; Cyrillic → Latin (đ = dj), then ASCII | street name |
 | Poland admin_level 7 / 6 / 8 / 9, place nodes | city (gmina) / municipality (powiat) / settlement / district |
 | Serbia admin_level 7 else 8 / 6 / 9 / 8; "Град (Кварт)" → district, "(село)" dropped | city (grad, opština) / municipality (okrug) / settlement (naselje) / district (gradska opština) |
+| other ExYugoslavia countries: the levels in `libs/countries.py`; bilingual "a / b" names → a; Albanian "Komuna e Prishtinës" → "prishtine" | city / municipality / settlement / district |
 | addr:housenumber + addr:street | house numbers on the nearest segment of the street, by side |
 | amenity fuel / hospital / police / bus_station / car_rental / parking + park_ride, tourism hotel / motel / museum, shop car / car_repair, railway station / halt, aeroway aerodrome (iata or public) | POI 12 / 41 / 42 / 54 / 13 / 15, 21 / 32, 11 / 59, 51, 52 |
-| natural water, landuse forest, leisure park, landuse cemetery, landuse residential …, place island, waterway river / canal, railway rail | background areas 1, 3, 3, 6, 5, 8 and lines 101, 102 |
+| natural water, landuse forest, leisure park, landuse cemetery, landuse residential …, place island, waterway river / canal, railway rail | background areas 1, 3, 3, 6, 5, 8 and lines 101, 102 (names: water, rivers and towns only) |
 
 ## 11. Open questions
 
@@ -495,42 +566,22 @@ TMC tables (not needed); the compression encoder (not needed).
 
 ## 12. Tools and reverse engineering
 
-- `tools/extract_navdb.py`: disc image → `temp/navdb/` (carindb, CARINET, …).
-- `tools/carindb_header.py`: block 0 dump.
-- `decoder.py`, `encoder.py`, `tools/mkdisc.py` and `tests/*`: see `../README.md`.
-- `decoder.py [carindb] [-o out.gpkg] [--area NAME | --bbox lon0,lat0,lon1,lat1] [--layers …] [--info]`: layers `parcels`,
-  `roads`, `areas`, `overview_roads`, `poi` (with address / phone / postcode), `cities`; RTree
-  index; QGIS styles in `layer_styles`.
-- `libs/spindex.py`: table 4 index directory and the kind 8 / 9 spatial index (`Index(f, a, b)`:
-  `cells(box)` yields the subcells with their data units, `pointers(box)` the data units under a
-  box, reading only the index units needed). With `--area` / `--bbox` the decoder reads only those
-  units (roads, background, POI), not whole tables.
-  Whole database ≈ 20 min, 2.8 GB.
-- Newer discs (DB_0 + DB_1, 512-byte blocks, zlib units, other index extent):
-  `../../docs/newer_disc_format.md`.
-- Ghidra (headless, Java script): `analyzeHeadless temp/navdb/ghidra navdb_db -import
-  temp/navdb/mods/*.mod -processor 68000:BE:32:MC68030 -postScript ExportOS9Modules.java
-  $PWD/temp/navdb/ghidra_out -scriptPath $PWD/tools/ghidra -overwrite`, then
-  `tools/ghidra/resolve_a6.py MODULE.mod EXPORT.md OUT.md` (A6 jump table and globals) and
-  `navdb/tools/annotate_dbq.py IN OUT INDEX --base 0x0ef8|0x0cf8` (RECSIZE names for dbq|pbp).
-  The script creates functions from `link a5` prologues and sets the Microware calling convention
-  (D0, D1, then stack). Module files: `re-safrane/extracted/flash_0209/*.mod`; copies in
-  `temp/navdb/mods/`. Do not use `export_os9_modules.py` there: it deletes
-  `temp/ghidra/OS9_Batch_Project`. Ghidra stops at the math trap (`trap #15` + a function word);
-  `tools/ghidra/dis68k.py` disassembles such ranges with capstone.
-- Router: `rpmod` (`temp/extracted/flash_0209/065_rpmod.mod`, copy in `temp/navdb/mods/`) has
-  its own copy of the db access library; record size table at data 0x168 (`annotate_dbq.py
-  --base 0x168` → `ghidra_out/065_rpmod.annotated.md`, index `rpmod_index.txt`). Key functions:
-  `FUN_0000ce00` segment → edge record, `FUN_0000c58e` node ring / edge point walk,
-  `FUN_0000b93a` / `FUN_0000b8ae` successors, `FUN_0000bb24` prohibited turn check, `FUN_0000bd04`
-  access check, `FUN_0000b148` travel time, `FUN_0000b2d6` turn cost, `FUN_00001d02` cost tables,
-  `FUN_00015eb6` node goes up a level, `FUN_000151cc` house number search, `FUN_000195e2` header
-  travel times, `FUN_0001d28a` / `FUN_0001d2e4` / `FUN_0001d364` slot 10 / 12 / 11 ranges. dbq is a
-  server: request dispatcher `FUN_00006dbc` (codes 0xc8.. → handlers; 0xc8 = slot 10 of a segment,
-  0xd5 = segment walk).
-- Key functions: pbp `FUN_00003508` dispatch, `FUN_00003eb2` parcel, `FUN_000035de`..`FUN_00003e8a`
-  parcel slots, `FUN_00004840`/`FUN_000044a2` background, `FUN_00004abc` text, `FUN_00004c16` bit
-  reader, `FUN_000049f2` setup, `FUN_00004a34`/`FUN_00004a5a` raw copies, `FUN_0000325c` record
-  sizes, read loop at 0x11fc; dbq `FUN_000128d4` get unit (via pbp), `FUN_00012834` release,
-  `FUN_00001890` segment walk, `FUN_000149ba` shape points, `FUN_00004cfc` signposts,
-  `FUN_00014dc4`/`FUN_00014f60` record sizes, `FUN_0000c5fa`/`c74c` record search by letter.
+- `navdb/decoder.py`, `navdb/encoder.py`, `navdb/tools/mkdisc.py`, `navdb/tests/*`: see
+  `navdb/README.md`.
+- `navdb/tools/carindb_header.py`: block 0 dump; `tools/extract_navdb.py`: files of a disc image.
+- **Ghidra** (headless, Java script `tools/ghidra/ExportOS9Modules.java`): creates functions from
+  `link a5` prologues, sets the Microware calling convention (D0, D1, then stack), exports C and
+  assembly to Markdown; `tools/ghidra/resolve_a6.py` names the A6 jump table targets and globals
+  (`g_XXXX`); `navdb/tools/annotate_dbq.py --base` names the record size globals (`dbq` 0x0ef8,
+  `pbp` 0x0cf8, `rpmod` 0x168). Ghidra stops at the math trap (`trap #15` + a function word):
+  `tools/ghidra/dis68k.py` disassembles such ranges with capstone. Modules: `temp/navdb/mods/`
+  (from the flash image), project `temp/navdb/ghidra/`, exports `temp/navdb/ghidra_out/`.
+- **Key functions**: pbp `FUN_00003508` dispatch, `FUN_00003eb2` parcel, `FUN_00004840` /
+  `FUN_000044a2` background, `FUN_00004abc` text, `FUN_00004c16` bit reader. dbq (a server;
+  dispatcher `FUN_00006dbc`, request codes 0xc8.. → handlers): `FUN_000128d4` get unit,
+  `FUN_00001890` segment walk, `FUN_000149ba` shape points, `FUN_00004cfc` signposts, `FUN_00014dc4`
+  / `FUN_00014f60` record sizes. rpmod (router, its own copy of the db library):
+  `FUN_0000ce00` segment → edge, `FUN_0000c58e` ring / edge point walk, `FUN_0000b93a` /
+  `FUN_0000b8ae` successors, `FUN_0000bb24` prohibited turns, `FUN_0000bd04` access, `FUN_0000b148`
+  travel time, `FUN_0000b2d6` turn cost, `FUN_00001d02` cost tables, `FUN_00015eb6` node goes up,
+  `FUN_000151cc` house numbers, `FUN_000195e2` header travel times.

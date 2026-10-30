@@ -1,5 +1,6 @@
 """Places for the encoder, the way the original (Navteq) names them (docs/format.md section 4,
-place hierarchy), with the OSM admin levels of the country (libs/countries.py). Poland: city =
+place hierarchy), with the OSM admin levels of each country (libs/countries.py); the country at
+a point comes from the countries' boundaries (Borders, Atlas). Poland: city =
 gmina (admin_level 7, without "gmina"), its municipality = powiat (admin_level 6); a street's
 second text = the settlement it lies in (admin_level 8 area, or the nearest place node), none in
 the gmina's own town. Polish street names get "ulica " unless they start with another street word,
@@ -10,6 +11,7 @@ import re
 import sqlite3
 import struct
 
+from .carindb import lat, lon
 from .osmnet import fold, gps
 
 STREET_WORDS = ("ulica", "aleja", "al.", "plac", "rondo", "osiedle", "skwer", "bulwar", "most",
@@ -23,9 +25,11 @@ CELL = 1 << 17    # grid of the areas and place nodes (~2.6 km north-south)
 
 def street_name(name, country=None):
     """The street name as written in the database: Polish names get "ulica " unless they start
-    with a street word; other countries keep the OSM name."""
+    with a street word; other countries keep the OSM name. Bilingual names ("a / b") keep the
+    first."""
     if not name:
         return None
+    name = name.split(" / ")[0]
     if country is not None and not country.street_prefix:
         return name
     first = name.split(" ", 1)[0]
@@ -47,8 +51,8 @@ class Grid:
         return self.cells.get((pt[0] // CELL, pt[1] // CELL), ())
 
 
-def _polygons(blob):
-    """GeoPackage (multi)polygon -> list of outer rings in GPS units."""
+def _polygons(blob, holes=False):
+    """GeoPackage (multi)polygon -> list of outer rings (and inner ones with holes) in GPS units."""
     flags = blob[3]
     env = {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}[(flags >> 1) & 7]
     wkb, pos = blob[8 + env:], 0
@@ -61,7 +65,7 @@ def _polygons(blob):
         for r in range(n_rings):
             n, = struct.unpack_from(order + "I", wkb, p)
             pts = [gps(*struct.unpack_from(order + "dd", wkb, p + 4 + 16 * i)) for i in range(n)]
-            if r == 0:
+            if r == 0 or holes:
                 rings.append(pts)
             p += 4 + 16 * n
         return p
@@ -91,16 +95,33 @@ def _inside(pt, ring):
     return inside
 
 
-QUALIFIERS = {"selo", "varos", "varosica", "naselje", "grad"}   # "Лучани (село)": village / town
+QUALIFIERS = {"selo", "varos", "varosica", "naselje", "grad",       # "Лучани (село)": village / town
+              "rs", "fbih"}                                     # Bosnia: "Ново Село (РС)" (entity)
+BILINGUAL = re.compile(r" / | - ")
 
 
 def _name(raw):
     """(folded name, folded base, folded bracket) of "Base (bracket)" names (Serbia: "Београд
-    (Вождовац)", "Лучани (село)")."""
+    (Вождовац)", "Лучани (село)"); of bilingual names ("Koper / Capodistria (naselje)",
+    "Opština Ulcinj - Komuna e Ulqinit") the first."""
+    raw = BILINGUAL.split(raw)[0]
     m = re.match(r"^(.*?)\s*\((.*)\)$", raw)
     if not m:
         return fold(raw), None, None
     return fold(raw), fold(m.group(1)), fold(m.group(2))
+
+
+def _admin_areas(rows):
+    """(name, level, outer rings simplified to 10 m) of admin area rows (in a worker)."""
+    from .levels import simplify
+    out = []
+    for _, name, level, geom in rows:
+        if not name or not fold(name):
+            continue
+        rings = [r for r in (simplify(ring, 10) for ring in _polygons(geom)) if len(r) >= 4]
+        if rings:
+            out.append((name, int(level), rings))
+    return out
 
 
 class Area:
@@ -117,22 +138,23 @@ class Area:
 
 
 class Places:
-    def __init__(self, gpkg, bbox, country):
-        from .osmsrc import rows
+    """Cities and settlements of one country (bbox: its box in degrees; borders: the place nodes
+    of other countries are left out)."""
+
+    def __init__(self, gpkg, bbox, country, borders=None):
+        from .osmsrc import prows, rows
         self.country = country
-        lv = {*country.levels[0], *country.levels[1:]}   # OSM admin levels: city, municipality, settlement, district
+        lv = {*country.levels[0], *country.levels[1:]} - {None}    # OSM admin levels: city, municipality, settlement, district
         self.levels = {k: [] for k in lv}
         self.grids = {k: Grid() for k in lv}
-        for _, name, level, geom in rows(gpkg,
+        for name, level, rings in prows(gpkg,
                 "SELECT coalesce('r' || m.osm_id, 'w' || m.osm_way_id), m.name, m.admin_level, m.geom FROM multipolygons m JOIN rtree_multipolygons_geom r "
                 "ON m.fid = r.id WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? AND r.miny <= ? AND "
                 "m.boundary = 'administrative' AND m.admin_level IN (%s)" % ",".join("'%d'" % k for k in set(lv)),
-                (bbox[0], bbox[2], bbox[1], bbox[3])):
-            rings = _polygons(geom)
-            if rings and name and fold(name):
-                a = Area(name, rings)
-                self.levels[int(level)].append(a)
-                self.grids[int(level)].add(a.box, a)
+                (bbox[0], bbox[2], bbox[1], bbox[3]), _admin_areas):
+            a = Area(name, rings)
+            self.levels[level].append(a)
+            self.grids[level].add(a.box, a)
         self.nodes = Grid()
         for _, name, place, geom in rows(gpkg,
                 "SELECT p.osm_id, p.name, p.place, p.geom FROM points p JOIN rtree_points_geom r ON p.fid = r.id "
@@ -142,13 +164,15 @@ class Places:
             if name:
                 lon, lat = struct.unpack_from("<dd", geom, 8 + _env(geom) + 5)     # WKB point
                 q = gps(lon, lat)
-                if fold(name):
-                    self.nodes.add((q[0], q[1], q[0], q[1]), (q, fold(name)))
+                if fold(name) and (borders is None or borders.at(q) == country.iso):
+                    self.nodes.add((q[0], q[1], q[0], q[1]), (q, fold(BILINGUAL.split(name)[0])))
         self.cache = {}
 
     def _area(self, level, pt, city=None):
         """Name of the area of that level at a point; "City (District)" gives the district,
         "Village (village)" the village."""
+        if level is None:
+            return None
         for a in self.grids[level].at(pt):
             if a.contains(pt):
                 if a.base and city and self._strip(a.base) == city and a.qual:
@@ -161,7 +185,11 @@ class Places:
     def _strip(self, name):
         for prefix in self.country.city_prefixes:
             if name and name.startswith(prefix):
-                return name[len(prefix):]
+                name = name[len(prefix):]
+                for end, new in self.country.genitive:      # "komuna e prishtines" -> "prishtine"
+                    if name.endswith(end):
+                        return name[:len(name) - len(end)] + new
+                return name
         return name
 
     def city_of(self, pt):
@@ -197,3 +225,80 @@ class Places:
 
 def _env(blob):
     return {0: 0, 1: 32, 2: 48, 3: 48, 4: 64}[(blob[3] >> 1) & 7]
+
+
+STRIP = 1 << 12     # GPS units (~80 m): horizontal strips of the boundary edges
+
+
+class Borders:
+    """The country at a point: the countries' OSM admin_level 2 boundaries (ISO3166-1 code),
+    simplified to 20 m. A horizontal ray test over the boundary edges of the point's strip; cells
+    no boundary passes keep their answer."""
+
+    def __init__(self, gpkg, countries):
+        from .levels import simplify
+        from .osmsrc import rows
+        self.isos = [c.iso for c in countries]
+        self.strips, self.near, self.cache = {}, set(), {}
+        self.boxes = {}                     # iso -> box in degrees
+        for k, c in enumerate(countries):
+            rings = []
+            for _, geom in rows(gpkg,
+                    "SELECT coalesce('r' || osm_id, 'w' || osm_way_id), geom FROM multipolygons WHERE "
+                    "boundary = 'administrative' AND admin_level = '2' AND other_tags LIKE ?",
+                    (f'%"ISO3166-1"=>"{c.iso.upper()}"%',)):
+                rings += [simplify(r, 20) for r in _polygons(geom, holes=True)]
+            if not rings:
+                raise SystemExit(f"no admin_level 2 boundary of {c.iso.upper()} in {c.extract}")
+            xs = [p[0] for r in rings for p in r]
+            ys = [p[1] for r in rings for p in r]
+            self.boxes[c.iso] = (lon(min(xs)), lat(min(ys)), lon(max(xs)), lat(max(ys)))
+            for r in rings:
+                for (x0, y0), (x1, y1) in zip(r, r[1:] + r[:1]):
+                    if y0 == y1:
+                        continue
+                    for s_ in range(min(y0, y1) // STRIP, max(y0, y1) // STRIP + 1):
+                        self.strips.setdefault(s_, []).append((k, x0, y0, x1, y1))
+                    steps = max(abs(x1 - x0), abs(y1 - y0)) // CELL + 1
+                    for i in range(steps + 1):
+                        cx = (x0 + (x1 - x0) * i // steps) // CELL
+                        cy = (y0 + (y1 - y0) * i // steps) // CELL
+                        for dx in (-1, 0, 1):
+                            for dy in (-1, 0, 1):
+                                self.near.add((cx + dx, cy + dy))
+        boxes = self.boxes.values()
+        self.bbox = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                     max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def at(self, pt):
+        """ISO code of the country at a point, None outside them all."""
+        cell = (pt[0] // CELL, pt[1] // CELL)
+        if cell in self.cache:
+            return self.cache[cell]
+        x, y = pt
+        inside = 0
+        for k, x0, y0, x1, y1 in self.strips.get(y // STRIP, ()):
+            if (y0 > y) != (y1 > y) and x < x0 + (y - y0) * (x1 - x0) / (y1 - y0):
+                inside ^= 1 << k
+        iso = next((c for k, c in enumerate(self.isos) if inside >> k & 1), None)
+        if cell not in self.near:
+            self.cache[cell] = iso
+        return iso
+
+
+class Atlas:
+    """The places of a disc's countries: the country at a point (Borders), then its Places."""
+
+    def __init__(self, gpkg, countries):
+        self.borders = Borders(gpkg, countries)
+        self.bbox = self.borders.bbox
+        self.countries = {c.iso: c for c in countries}
+        self.places = {c.iso: Places(gpkg, self.borders.boxes[c.iso], c, self.borders) for c in countries}
+
+    def country_at(self, pt):
+        return self.countries.get(self.borders.at(pt))
+
+    def clear(self):
+        """Forget the cached answers (they must not depend on earlier lookups)."""
+        for p in self.places.values():
+            p.cache.clear()

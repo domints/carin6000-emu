@@ -7,9 +7,10 @@ museums), written as the original's tables:
         records (position, access segment, brand, street, city, municipality, country, house
         number, id, phone, postcode), 8-byte access records (parcel, segment, side)
   12    one trie per list (first letters -> table 11 entries), reached from the city records'
-        category lists (table d slot 3) and the country's (block 4 slot 3; airports, museums)
+        category lists (table d slot 3) and the countries' (block 4 slot 3; airports, museums)
 
-A POI belongs to the gmina (city record) it lies in; POIs of other cities are not listed.
+A POI belongs to the gmina (city record) it lies in; POIs of other cities and outside the disc's
+countries are not listed.
 """
 import math
 import struct
@@ -73,6 +74,7 @@ class Poi:
     city: str = None
     muni: str = None
     district: str = None
+    country: object = None        # libs/countries.Country
     access: tuple = None          # (parcel, segment index, side)
     ident: int = 0
 
@@ -130,8 +132,13 @@ def load(gpkg, bbox, country):
     return out
 
 
-def place(pois, places, parcels, sorted_pieces):
-    """City, district and access segment of every POI."""
+def place(pois, atlas, parcels, sorted_pieces):
+    """Country, city, district and access segment of every POI; returns those inside the
+    countries (atlas: osmplaces.Atlas)."""
+    atlas.clear()                           # the answers must not depend on earlier lookups
+    for p in pois:
+        p.country = atlas.country_at(p.pt)
+    pois[:] = [p for p in pois if p.country]
     grid, cell = {}, 1 << 13
     for pc in parcels:
         for idx, piece in enumerate(sorted_pieces(pc)):
@@ -142,6 +149,7 @@ def place(pois, places, parcels, sorted_pieces):
                         grid.setdefault((cx, cy), []).append((pc, idx, pts[i], pts[i + 1], piece.road.cls))
     for n, p in enumerate(pois):
         p.ident = n + 1
+        places = atlas.places[p.country.iso]
         p.city, p.muni = places.city_of(p.pt)
         p.district = places.settlement_of(p.pt)
         best = None
@@ -171,17 +179,17 @@ def _project(pt, a, b):
 
 
 class PoiTables:
-    """Tables 7, 11 and 12 for the POIs; lists: city key (name, muni) -> [(category, list key)]
-    and the country-wide lists, for search.add_tables."""
+    """Tables 7, 11 and 12 for the POIs; lists: city key (country ISO, name, muni) -> [(category,
+    list key)] and country ISO -> the country-wide lists, for search.add_tables."""
 
-    def __init__(self, pois, city_keys, country, lang):
-        self.country, self.lang = country, lang
+    def __init__(self, pois, city_keys):
         lists = {}
         for p in pois:
-            if (p.city, p.muni) in city_keys:
-                lists.setdefault(("c", p.city, p.muni, p.cat), []).append(p)
+            iso = p.country.iso
+            if (iso, p.city, p.muni) in city_keys:
+                lists.setdefault(("c", iso, p.city, p.muni, p.cat), []).append(p)
             if p.cat in COUNTRY_WIDE:
-                lists.setdefault(("w", p.cat), []).append(p)
+                lists.setdefault(("w", iso, p.cat), []).append(p)
         self.lists = {}
         for key, items in sorted(lists.items(), key=lambda kv: str(kv[0])):
             items.sort(key=lambda p: (p.name, p.district or ""))
@@ -191,15 +199,18 @@ class PoiTables:
         self.city_lists = {}
         for key in self.lists:
             if key[0] == "c":
-                self.city_lists.setdefault((key[1], key[2]), []).append((key[3], key))
-        self.country_lists = [(key[1], key) for key in self.lists if key[0] == "w"]
+                self.city_lists.setdefault(key[1:4], []).append((key[4], key))
+        self.country_lists = {}
+        for key in self.lists:
+            if key[0] == "w":
+                self.country_lists.setdefault(key[1], []).append((key[2], key))
         self._pack_names()
         self._pack_tries()
         self.pois = [p for p in pois if p in self.home]
 
     # table 11: groups (trie leaves) packed into units
     def _row_texts(self, p):
-        return (p.name, p.district or p.city, p.brand, p.street, p.city, p.muni, self.country,
+        return (p.name, p.district or p.city, p.brand, p.street, p.city, p.muni, p.country.name,
                 p.housenumber, p.phone, p.postcode)
 
     def _pack_names(self):
@@ -254,7 +265,7 @@ class PoiTables:
         acc = o_acc
         for k, p in enumerate(rows):
             rec = o_rec + 40 * k
-            struct.pack_into(">HHHH", d, 0x30 + 8 * k, t(p.name), self.lang, t(p.district or p.city), rec)
+            struct.pack_into(">HHHH", d, 0x30 + 8 * k, t(p.name), p.country.lang, t(p.district or p.city), rec)
             a_off, a_n = acc, 0
             if p.access:
                 pc, idx, side = p.access
@@ -262,7 +273,7 @@ class PoiTables:
                 acc += 8
                 a_n = 1
             struct.pack_into(">iiHHHHHHHHHHIHHHH", d, rec, p.pt[0], p.pt[1], a_off if a_n else 0, a_n,
-                             t(p.brand), t(p.street), t(p.city), t(p.muni), t(self.country), 0, 0,
+                             t(p.brand), t(p.street), t(p.city), t(p.muni), t(p.country.name), 0, 0,
                              t(p.housenumber), p.ident, t(p.phone), t(p.postcode), 0, 0)
         for v, o in off.items():
             d[o:o + len(v)] = v.encode("latin1", "replace")

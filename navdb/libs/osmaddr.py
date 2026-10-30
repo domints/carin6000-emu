@@ -22,25 +22,32 @@ STREET = re.compile(r'"addr:street"=>"((?:[^"\\]|\\.)*)"')
 def load(gpkg, bbox, country=None):
     """[(point, street name as the encoder writes it, number)]; buildings at the middle of their
     box (from the GeoPackage's R-tree, no geometry is parsed)."""
-    from .osmsrc import rows
+    from .osmsrc import prows
     out = []
-    names = {}
     for layer in ("points", "multipolygons"):
         key = "'p' || l.osm_id" if layer == "points" else "coalesce('r' || l.osm_id, 'w' || l.osm_way_id)"
-        for _, other, x, y in rows(gpkg,
+        out += prows(gpkg,
                 f"SELECT {key}, l.other_tags, (r.minx + r.maxx) / 2, (r.miny + r.maxy) / 2 FROM {layer} l "
                 f"JOIN rtree_{layer}_geom r ON l.fid = r.id "
                 "WHERE r.maxx >= ? AND r.minx <= ? AND r.maxy >= ? AND r.miny <= ? "
-                "AND l.other_tags LIKE '%addr:housenumber%'", (bbox[0], bbox[2], bbox[1], bbox[3])):
-            m = NUMBER.search(other)
-            st = STREET.search(other)
-            if not m or not st or int(m.group(1)) >= 32767:
-                continue
-            raw = st.group(1)
-            if raw not in names:
-                names[raw] = street_name(fold(raw), country)
-            if names[raw]:
-                out.append((gps(x, y), names[raw], int(m.group(1))))
+                "AND l.other_tags LIKE '%addr:housenumber%'", (bbox[0], bbox[2], bbox[1], bbox[3]),
+                lambda rows: _addresses(rows, country))
+    return out
+
+
+def _addresses(rows, country):
+    """Addresses of the rows (in a worker)."""
+    out, names = [], {}
+    for _, other, x, y in rows:
+        m = NUMBER.search(other)
+        st = STREET.search(other)
+        if not m or not st or int(m.group(1)) >= 32767:
+            continue
+        raw = st.group(1)
+        if raw not in names:
+            names[raw] = street_name(fold(raw), country)
+        if names[raw]:
+            out.append((gps(x, y), names[raw], int(m.group(1))))
     return out
 
 
@@ -60,7 +67,9 @@ def _nearest_chunk(grid, pieces, chunk):
     out = []
     for pt, street, number in chunk:
         best = None
-        for k, i, done, seg_len in grid.get((pt[0] // CELL, pt[1] // CELL), ()):
+        cx, cy = pt[0] // CELL, pt[1] // CELL
+        near = [e for dx in (-1, 0, 1) for dy in (-1, 0, 1) for e in grid.get((cx + dx, cy + dy), ())]
+        for k, i, done, seg_len in near:
             piece = pieces[k]
             if piece.road.name != street:
                 continue
@@ -86,8 +95,8 @@ def assign(parcels, addresses):
             done = 0.0
             for i in range(len(pts) - 1):
                 seg_len = math.hypot((pts[i + 1][0] - pts[i][0]) * 0.62, pts[i + 1][1] - pts[i][1])
-                for cx in range(min(pts[i][0], pts[i + 1][0]) // CELL - 1, max(pts[i][0], pts[i + 1][0]) // CELL + 2):
-                    for cy in range(min(pts[i][1], pts[i + 1][1]) // CELL - 1, max(pts[i][1], pts[i + 1][1]) // CELL + 2):
+                for cx in range(min(pts[i][0], pts[i + 1][0]) // CELL, max(pts[i][0], pts[i + 1][0]) // CELL + 1):
+                    for cy in range(min(pts[i][1], pts[i + 1][1]) // CELL, max(pts[i][1], pts[i + 1][1]) // CELL + 1):
                         grid.setdefault((cx, cy), []).append((k, i, done, seg_len))
                 done += seg_len
     step = 20000

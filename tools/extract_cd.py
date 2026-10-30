@@ -34,7 +34,7 @@ with open(IMAGE, "rb") as f:
     idx = 0
     dir_num = 1
 
-    # 1. Parsowanie Type M Path Table
+    # 1. Parse the Type M path table
     while idx < len(pt_data):
         len_di = pt_data[idx]
         if len_di == 0:
@@ -50,7 +50,7 @@ with open(IMAGE, "rb") as f:
         idx += 8 + len_di + (len_di % 2)
         dir_num += 1
 
-    # 2. Tworzenie pełnego drzewa katalogów na dysku
+    # 2. Create the whole directory tree on disk
     paths = {1: OUT}
     for d in directories[1:]:
         parent_path = paths[d["parent"]]
@@ -60,7 +60,7 @@ with open(IMAGE, "rb") as f:
 
     os.makedirs(OUT, exist_ok=True)
 
-    # 3. Zrzut plików
+    # 3. Dump the files
     for d in directories:
         dir_sector = read_lba(f, d["lba"])
         offset = 0
@@ -74,12 +74,12 @@ with open(IMAGE, "rb") as f:
             file_lba  = struct.unpack(">I", record[6:10])[0]
             file_size = struct.unpack(">I", record[14:18])[0]
             
-            # Flagi: offset 24 dla CD-i Green Book, offset 25 dla ISO 9660
+            # Flags: offset 24 for CD-i Green Book, offset 25 for ISO 9660
             is_directory_flag = bool((record[24] & 2) or (record[25] & 2))
             name_len  = record[32]
             raw_name  = record[33 : 33 + name_len]
 
-            # Pomijanie wpisów . i .. oraz katalogów
+            # Skip the . and .. entries and directories
             if raw_name not in (b"\x00", b"\x01") and not is_directory_flag and (file_lba not in dir_lbas):
                 fname = raw_name.decode("ascii", errors="replace").split(";")[0]
                 target_path = os.path.join(paths[d["id"]], fname)
@@ -95,8 +95,8 @@ with open(IMAGE, "rb") as f:
 
                 with open(target_path, "wb") as out:
                     out.write(file_bytes[:file_size])
-                print(f"[+] Zapisano: {target_path} ({file_size} B)")
+                print(f"[+] Written: {target_path} ({file_size} B)")
 
             offset += rec_len
 
-print("\n[OK] Ekstrakcja zakończona pomyślnie.")
+print("\n[OK] Extraction finished.")

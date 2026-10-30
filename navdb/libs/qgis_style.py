@@ -40,10 +40,10 @@ def roads_qml():
     key = 0
     for cls, (colour, width, maxscale) in sorted(CLASSES.items(), reverse=True):
         scale = f' scalemaxdenom="{maxscale}" scalemindenom="1"' if maxscale else ""
-        rules.append(f'<rule key="r{key}" symbol="{key}" label="klasa {cls}" filter="&quot;level&quot; = 0 AND &quot;kind&quot; != 5 AND &quot;class&quot; = {cls}"{scale}/>')
+        rules.append(f'<rule key="r{key}" symbol="{key}" label="class {cls}" filter="&quot;level&quot; = 0 AND &quot;kind&quot; != 5 AND &quot;class&quot; = {cls}"{scale}/>')
         symbols.append(_line_symbol(str(key), colour, width))
         key += 1
-    rules.append(f'<rule key="r{key}" symbol="{key}" label="nie do nawigacji" filter="&quot;level&quot; = 0 AND &quot;kind&quot; = 5" scalemaxdenom="30000" scalemindenom="1"/>')
+    rules.append(f'<rule key="r{key}" symbol="{key}" label="not routable" filter="&quot;level&quot; = 0 AND &quot;kind&quot; = 5" scalemaxdenom="30000" scalemindenom="1"/>')
     symbols.append(_line_symbol(str(key), "#b4b4b4", 0.2, dash=True))
     return f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <qgis version="3.34" styleCategories="AllStyleCategories" labelsEnabled="1">
@@ -120,7 +120,7 @@ def areas_qml():
                           (3, 8_000_000, 20_000_000), (4, 20_000_000, 50_000_000), (5, 50_000_000, 0)):
         for typ, rgb in AREA_COLOURS.items():
             scale = f' scalemindenom="{lo}"' + (f' scalemaxdenom="{hi}"' if hi else "")
-            rules.append(f'<rule key="a{key}" symbol="{key}" label="poziom {level} typ {typ}" '
+            rules.append(f'<rule key="a{key}" symbol="{key}" label="level {level} type {typ}" '
                          f'filter="&quot;level&quot; = {level} AND &quot;type&quot; = {typ}"{scale}/>')
             symbols.append(_fill_symbol(str(key), rgb))
             key += 1

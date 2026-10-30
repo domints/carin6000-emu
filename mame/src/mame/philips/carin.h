@@ -44,6 +44,9 @@ public:
 		, m_car_controls(*this, "CAR")
 		, m_ignition_led(*this, "ignition")
 		, m_car_input(*this, "CAR_KEYS")
+		, m_car_drive(*this, "CAR_DRIVE")
+		, m_car_view(*this, "car_view%u", 0U)
+		, m_car_cmd(*this, "car_cmd%u", 0U)
 	{ }
 
 	void carin(machine_config &config);
@@ -111,9 +114,24 @@ private:
 	void slave_gps_tick();
 	bool slave_gps_record();
 	bool m_gps_pending = false;
-	// Car side: where the car is (degrees, north/east positive); fixed until the car emulator moves it.
-	double m_car_latitude = 52.2297;
-	double m_car_longitude = 21.0122;
+	// Car side: the simulated car behind the slave's dead reckoning (B2) and GPS receiver (B3), driven by
+	// the CAR_DRIVE keys and by the car window (plugin carsim) through m_car_view / m_car_cmd.
+	required_ioport m_car_drive;
+	emu_timer *m_car_sim_timer = nullptr;
+	TIMER_CALLBACK_MEMBER(car_sim_tick);
+	void car_sim_command();
+	double m_car_latitude = 52.2297;       // degrees, north positive
+	double m_car_longitude = 21.0122;      // degrees, east positive
+	double m_car_heading = 0;              // degrees clockwise from north
+	double m_car_speed = 0;                // m/s, negative in reverse
+	double m_car_odometer = 0;             // m
+	bool m_car_gps_fix = true;             // the GPS antenna sees the sky
+	double m_dr_distance = 0;              // cm driven since the last B2 record
+	double m_dr_turn = 0;                  // 0.01 degree turned since the last B2 record
+	double m_dr_error = 0;                 // cm, the slave's position error estimate (B2 L8/L9)
+	attotime m_dr_last;                    // time of the last B2 record
+	output_finder<8> m_car_view;           // car_view0-7: for the car window, see car_sim_tick
+	output_finder<4> m_car_cmd;            // car_cmd0-3: from the car window, see car_sim_command
 	int32_t gps_latitude() const;
 	int32_t gps_longitude() const;
 	unsigned m_car_notifies = 0;           // "data available" announcements still to send
@@ -151,6 +169,7 @@ private:
 	void vsc_map(address_map &map) ATTR_COLD;
 	void placeholder_palette(palette_device &palette) const;
 	uint32_t screen_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
+	uint32_t carsim_update(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
 	TIMER_CALLBACK_MEMBER(pc_watch_tick);
 	TIMER_CALLBACK_MEMBER(system_tick);
 	uint32_t mcasic_r(offs_t offset);

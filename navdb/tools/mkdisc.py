@@ -141,7 +141,7 @@ def build(carindb, output, template, chd=False, log=print):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/warszawa/carindb")
+    ap.add_argument("carindb", nargs="?", type=Path, default=ROOT / "temp/navdb/poland/carindb")
     ap.add_argument("-o", "--output", type=Path, default=ROOT / "cd/carin_osm.img")
     ap.add_argument("--template", type=Path, default=ROOT / "cd/carin_maps_pl_2012_2013.img")
     ap.add_argument("--chd", action="store_true", help="also make a .chd for MAME (chdman)")
