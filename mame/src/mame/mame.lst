@@ -15,3 +15,6 @@ carin0109
 
 @source:daytona/dvd90.cpp
 opel_dvd90
+
+@source:st10/st10test.cpp
+st10test

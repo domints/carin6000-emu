@@ -27,12 +27,27 @@ def main():
     for name in ("mame.log", "error.log"):
         (LOG / name).unlink(missing_ok=True)
     env = dict(os.environ, SDL_VIDEO_DRIVER="dummy", SDL_AUDIODRIVER="dummy")
-    # Each run starts from a fresh copy of the built NAND image (tools/opel_nand.py).
-    seed = ROOT / "state" / "opel_dvd90" / "nand.bin"
+    # Never mount the original factory dump: the guest consumes CHKDSKOK and
+    # can update its NVR files. Each run gets a disposable working copy.
+    factory = ROOT / "state" / "CD70NAVI_K9F5608U0C@TSOP48.BIN"
+    generated = ROOT / "state" / "opel_dvd90" / "nand.bin"
+    seed = factory if factory.exists() else generated
     if seed.exists():
         work = LOG / "nand.bin"
         shutil.copyfile(seed, work)
         env["OPEL_NAND"] = str(work)
+    if not env.get("OPEL_RADIO"):
+        radio = ROOT / "state" / "CD70_TMP92FD54_radu.bin"
+        if radio.exists():
+            env["OPEL_RADIO"] = str(radio)
+    if not env.get("OPEL_ST10"):
+        internal = ROOT / "state" / "CD70_ST10F269_internal.bin"
+        if internal.exists():
+            env["OPEL_ST10"] = str(internal)
+    if not env.get("OPEL_ST10_EXT"):
+        external = ROOT / "state" / "CD70_AM29F800BB@TSOP48.BIN"
+        if external.exists():
+            env["OPEL_ST10_EXT"] = str(external)
     cmd = [
         str(ROOT / "mame" / "mame"), "opel_dvd90",
         "-rompath", str(ROOT / "roms"),

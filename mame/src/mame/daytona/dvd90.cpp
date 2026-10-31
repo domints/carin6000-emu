@@ -55,13 +55,18 @@
     opened on the first READ CAPACITY or READ, not at startup: parsing the
     4 GB file during machine start blows the run's wall clock. The file
     manager mounts it through this ATAPI port and dbd then looks for
-    DB/DB_0. The TLCS-900 radio CPU sits on the other side of a UART /
-    DIPC link and is not emulated.
+    DB/DB_0. The TMP92FD54 radio CPU and the ST10F269 gateway run
+    beside the nav CPU. Radio SIO0 (TXD0/RXD0) is wired to nav UART
+    /t2. Radio SIO1 (TXD1/RXD1) is the gateway ASC0. The nav DIPC
+    channel is still unknown, so the gateway is not attached to a
+    nav UART.
 
 ***************************************************************************/
 
 #include "emu.h"
+#include "cpu/c166/st10f269.h"
 #include "cpu/mips/mips1.h"
+#include "cpu/tlcs900/tmp92fd54.h"
 #include "imagedev/cdromimg.h"
 #include "screen.h"
 
@@ -87,6 +92,13 @@ constexpr uint8_t NAND_DEVICE = 0x75; // K9F5608U0C, 32 MB
 
 constexpr offs_t NAND_BASE = 0xfffe6000;
 constexpr offs_t DMA_BASE = 0xfffeb000;
+
+// OS-9 scspiluart descriptors: /t0 ff904000, /t1 ff904100, /t2 ff904200,
+// /t3 ff904300. /t1 is the debug console (vector 0x60). /t2 is the next
+// port and the one SIO0 is tied to. Vector 0x62, cause index 0x12.
+// Emulator channel is (address - ff904100) >> 8.
+constexpr unsigned RADIO_UART = 1;
+constexpr uint32_t RADIO_UART_IRQ = 0x12;
 
 // SmartMedia (SSFDC) ECC over 256 bytes: two bytes of line parity and one of column parity.
 void smartmedia_ecc(const uint8_t *data, uint8_t ecc[3])
@@ -132,6 +144,8 @@ public:
 	opel_dvd90_state(const machine_config &mconfig, device_type type, const char *tag)
 		: driver_device(mconfig, type, tag)
 		, m_navcpu(*this, "navcpu")
+		, m_radiocpu(*this, "radiocpu")
+		, m_gateway(*this, "gateway")
 		, m_cdrom(*this, "cdrom")
 		, m_panel(*this, "PANEL")
 		, m_pad(*this, "PAD")
@@ -153,6 +167,10 @@ private:
 	bool uart_r(offs_t address, uint32_t &data);
 	bool uart_w(offs_t address, uint32_t data, uint32_t mem_mask);
 	void uart_flush(unsigned channel);
+	void radio_tx0(uint8_t data);
+	void radio_tx1(uint8_t data);
+	void radio_tx(unsigned channel, uint8_t data);
+	void gateway_tx(uint8_t data);
 	void log_asic(const char *dir, offs_t address, uint32_t data, uint32_t mem_mask);
 	bool i2c_r(offs_t address, uint32_t &data);
 	void i2c_watch(offs_t address);
@@ -169,6 +187,8 @@ private:
 	bool timer_w(offs_t address, uint32_t data, uint32_t mem_mask);
 	void timer_schedule(int channel);
 	void timer_tick(int channel);
+	uint8_t timer_priority(uint32_t index) const;
+	uint32_t compare_irq() const;
 	void tick_schedule();
 	void tick_fire(int param);
 	void cd_irq_drop(int param);
@@ -198,6 +218,8 @@ private:
 	void dma_run(unsigned channel);
 
 	required_device<r3041_device> m_navcpu;
+	required_device<tmp92fd54_device> m_radiocpu;
+	required_device<st10f269_device> m_gateway;
 	required_device<cdrom_image_device> m_cdrom;
 	required_ioport m_panel;
 	required_ioport m_pad;
@@ -210,6 +232,7 @@ private:
 	uint32_t m_timer_cmp[8] = { };
 	uint32_t m_timer_pending = 0;
 	uint32_t m_timer_log = 0;
+	uint8_t m_sens_irq = 0;
 	uint32_t m_tcu_ctrl = 0;
 	uint32_t m_tcu_scale = 0;
 	uint32_t m_tcu_period = 0;
@@ -278,6 +301,9 @@ private:
 	std::string m_uart_line[4];
 	std::string m_uart_rx[4];
 	uint32_t m_uart_log = 0;
+
+	std::string m_radio_line[2];
+	uint32_t m_radio_log = 0;
 };
 
 void opel_dvd90_state::navcpu_map(address_map &map)
@@ -315,6 +341,19 @@ uint32_t opel_dvd90_state::asic_r(offs_t offset, uint32_t mem_mask)
 	offs_t const address = 0xff000000 + (offset << 2);
 	if (address >= NAND_BASE && address < NAND_BASE + 0x20)
 		return nand_r((address - NAND_BASE) >> 2);
+
+	// sens_gps pulse counter at FF907010. The service routine adds bits 19:8
+	// into its sample total and posts signal 60000 once that total reaches
+	// 1000. Reading the counter is what retires interrupt 0x6b.
+	if (address == 0xff907010)
+	{
+		if (m_sens_irq)
+		{
+			m_sens_irq = 0;
+			irq_sync();
+		}
+		return 100u << 8;
+	}
 
 	uint32_t block_data = 0;
 	if (timer_r(address, block_data) || irq_r(address, block_data))
@@ -651,6 +690,9 @@ bool opel_dvd90_state::uart_w(offs_t address, uint32_t data, uint32_t mem_mask)
 			byte = (data >> shift) & 0xff;
 			break;
 		}
+	// /t2 is the radio SIO0 link. The console on /t1 is left alone.
+	if (channel == RADIO_UART)
+		m_radiocpu->rx_w(0, byte);
 	if (byte == '\n' || byte == '\r')
 		uart_flush(channel);
 	else if (byte >= 0x20 && byte < 0x7f)
@@ -660,6 +702,56 @@ bool opel_dvd90_state::uart_w(offs_t address, uint32_t data, uint32_t mem_mask)
 	if (m_uart_line[channel].size() >= 160)
 		uart_flush(channel);
 	return true;
+}
+
+void opel_dvd90_state::radio_tx0(uint8_t data)
+{
+	radio_tx(0, data);
+}
+
+void opel_dvd90_state::radio_tx1(uint8_t data)
+{
+	radio_tx(1, data);
+}
+
+void opel_dvd90_state::radio_tx(unsigned channel, uint8_t data)
+{
+	// SIO0 -> nav /t2. SIO1 is the ST10F269 ASC0.
+	if (channel == 1)
+		m_gateway->asc_rx(data);
+	if (channel == 0)
+	{
+		m_uart_rx[RADIO_UART].push_back(char(data));
+		irq_sync();
+	}
+	char const *peer = channel == 0 ? "nav /t2" : "gateway";
+	if (data == '\n' || data == '\r')
+	{
+		if (m_radio_line[channel].empty())
+			return;
+		if (m_radio_log < 80)
+		{
+			m_radio_log++;
+			logerror("radio SIO%u -> %s: %s\n", channel, peer, m_radio_line[channel]);
+		}
+		m_radio_line[channel].clear();
+		return;
+	}
+	if (data >= 0x20 && data < 0x7f)
+		m_radio_line[channel].push_back(char(data));
+	else
+		m_radio_line[channel] += util::string_format("<%02X>", data);
+	if (m_radio_line[channel].size() >= 120 && m_radio_log < 80)
+	{
+		m_radio_log++;
+		logerror("radio SIO%u -> %s: %s\n", channel, channel == 0 ? "nav /t2" : "gateway", m_radio_line[channel]);
+		m_radio_line[channel].clear();
+	}
+}
+
+void opel_dvd90_state::gateway_tx(uint8_t data)
+{
+	m_radiocpu->rx_w(1, data);
 }
 
 void opel_dvd90_state::uart_flush(unsigned channel)
@@ -1126,7 +1218,10 @@ bool opel_dvd90_state::timer_w(offs_t address, uint32_t data, uint32_t mem_mask)
 	unsigned const index = (address - 0xff905200) >> 2;
 	uint32_t &reg = index < 8 ? m_timer_ctrl[index] : m_timer_cmp[index - 8];
 	reg = (reg & ~mem_mask) | (data & mem_mask);
-	if (index < 8 && !(reg & 1))
+	// Bit 0 arms the channel. Bit 1 is the acknowledge: the service routine
+	// ORs it back into the control word and leaves bit 0 set when it re-arms.
+	// A control write with bit 1 set therefore drops the pending line.
+	if (index < 8 && (!(reg & 1) || (reg & 2)))
 		m_timer_pending &= ~(1u << index);
 	timer_schedule(index < 8 ? index : index - 8);
 	irq_sync();
@@ -1147,36 +1242,83 @@ void opel_dvd90_state::timer_schedule(int channel)
 	m_pit[channel]->adjust(attotime::from_usec(delta == 0 ? 1 : delta), channel);
 }
 
+// Compare channel to Cause index (irq number minus 0x50). fm_sens_gps installs
+// one service routine per channel from this table. Channel 0 is the software
+// timer, irq 0x6c. Channel 2 is the sens_gps alarm, irq 0x63.
+static uint32_t const k_timer_irq[8] = { 0x1c, 0x1a, 0x13, 0x0f, 0x09, 0x07, 0x04, 0x01 };
+
+// Picsub priority byte. The base register is FFFEC010 and the byte for a
+// source index lives at FFFEC010 + (index ^ 3). A zero byte means the guest
+// has not published the handler; raising the line then re-enters forever.
+uint8_t opel_dvd90_state::timer_priority(uint32_t index) const
+{
+	uint32_t const byte_addr = 0xfffec010 + (index ^ 3);
+	auto const found = m_regs.find(byte_addr & ~3u);
+	if (found == m_regs.end())
+		return 0;
+	unsigned const shift = (3u - (byte_addr & 3)) * 8;
+	return uint8_t((found->second >> shift) & 0xff);
+}
+
+// Highest published compare channel other than the software timer. Channel 2
+// is published at 0x0B, between tim0 (0x0C) and the software timer (0x0A).
+uint32_t opel_dvd90_state::compare_irq() const
+{
+	uint32_t index = 0;
+	uint8_t best = 0;
+	for (int channel = 1; channel < 8; channel++)
+	{
+		if (!(m_timer_pending & (1u << channel)))
+			continue;
+		uint8_t const priority = timer_priority(k_timer_irq[channel]);
+		if (priority > best)
+		{
+			best = priority;
+			index = k_timer_irq[channel];
+		}
+	}
+	return index;
+}
+
 void opel_dvd90_state::timer_tick(int channel)
 {
 	if (!(m_timer_ctrl[channel] & 1))
 		return;
-	// Source 0x6c is the tick. Its service routine arms channel 0 itself, so
-	// the first request has to come from whichever compare elapses first.
-	// Later channel 0 carries the tick. Other channels are one-shot.
-	// The tick service routine (source 0x6c, channel 0) follows the deadline
-	// pointer before testing it. An empty list therefore has to stay quiet:
-	// raising the line makes it treat the vector page as a deadline and kill
-	// the process that was running. Other channels are one-shot compares; their
-	// service routines are selected by source index and are not wired yet.
-	if (channel != 0)
+	// Source 0x6c is the software timer. Its service routine follows the
+	// deadline pointer before testing it. An empty list therefore has to stay
+	// quiet: raising the line makes it treat the vector page as a deadline
+	// and kill the process that was running.
+	if (channel == 0)
 	{
-		if (m_timer_log < 8)
-		{
-			m_timer_log++;
-			logerror("timer %d elapsed at %08X\n", channel, timer_now());
-		}
-		m_pit[channel]->enable(false);
+		address_space &space = m_navcpu->space(AS_PROGRAM);
+		auto rd = [&](uint32_t addr) { return space.read_dword(addr & 0x1fffffff); };
+		uint32_t const desc = rd(0x80090b10 + 0x6c * 4);
+		uint32_t const head = rd(rd(rd(desc + 4) + 0x124));
+		if ((desc >> 28) != 0x8 || head == 0)
+			return;
+		m_timer_pending |= 1;
+		m_irq_status |= 1;
+		irq_sync();
 		return;
 	}
-	address_space &space = m_navcpu->space(AS_PROGRAM);
-	auto rd = [&](uint32_t addr) { return space.read_dword(addr & 0x1fffffff); };
-	uint32_t const desc = rd(0x80090b10 + 0x6c * 4);
-	uint32_t const head = rd(rd(rd(desc + 4) + 0x124));
-	if ((desc >> 28) != 0x8 || head == 0)
+	if (m_timer_log < 8)
+	{
+		m_timer_log++;
+		logerror("timer %d elapsed at %08X\n", channel, timer_now());
+	}
+	// The handler is selected by the picsub byte. Leave the channel quiet
+	// until that byte is published.
+	if (timer_priority(k_timer_irq[channel]) == 0)
 		return;
-	m_timer_pending |= 1;
-	m_irq_status |= 1;
+	m_timer_pending |= 1u << channel;
+	// Channel 2's callback kicks the sensor block, whose completion is
+	// interrupt 0x6b (cause index 0x1b). Deliver it once that block is enabled.
+	if (channel == 2)
+	{
+		auto const ctrl = m_regs.find(0xff907004);
+		if (ctrl != m_regs.end() && (ctrl->second & 1) && timer_priority(0x1b))
+			m_sens_irq = 1;
+	}
 	irq_sync();
 }
 
@@ -1279,11 +1421,19 @@ void opel_dvd90_state::irq_sync()
 		index = m_cd_irq;
 	else if (m_tcu_status & 1)
 		index = 0x17;
+	else if (uint32_t const compare = compare_irq())
+		index = compare;
+	else if (m_sens_irq && timer_priority(0x1b))
+		// fm_sens_gps installs the sensor block as irq 0x6b.
+		index = 0x1b;
 	else if (m_timer_pending & 1)
 		index = 0x1c;
 	else if (!m_uart_rx[0].empty())
-		// scspiluart's console sits on the first port, dispatch slot 0x60.
+		// scspiluart /t1, the debug console, vector 0x60.
 		index = 0x10;
+	else if (!m_uart_rx[RADIO_UART].empty() && timer_priority(RADIO_UART_IRQ))
+		// /t2, vector 0x62. Held until the guest publishes the handler.
+		index = RADIO_UART_IRQ;
 	else if (m_i2c_irq & 1)
 		// dr_i2c_spf installs FF901000 as irq 0x53.
 		index = 3;
@@ -1606,6 +1756,70 @@ void opel_dvd90_state::machine_start()
 		}
 	}
 
+	if (const char *path = std::getenv("OPEL_RADIO"))
+	{
+		std::ifstream in(path, std::ios::binary);
+		if (in)
+		{
+			std::vector<uint8_t> image(0x80000);
+			in.read(reinterpret_cast<char *>(image.data()), image.size());
+			auto const n = unsigned(in.gcount());
+			m_radiocpu->load_flash(image.data(), n);
+			logerror("radio: loaded %s (%u bytes)\n", path, n);
+		}
+		else
+			logerror("radio: could not open %s\n", path);
+	}
+
+	auto load_bin = [this](char const *env, char const *filename) -> std::vector<uint8_t>
+	{
+		std::string path;
+		if (char const *from_env = std::getenv(env))
+			path = from_env;
+		else
+		{
+			char const *dirs[] = { "state/", "../state/", "../../state/" };
+			for (char const *dir : dirs)
+			{
+				std::string trial = std::string(dir) + filename;
+				std::ifstream test(trial, std::ios::binary);
+				if (test)
+				{
+					path = std::move(trial);
+					break;
+				}
+			}
+		}
+		std::vector<uint8_t> image;
+		if (path.empty())
+			return image;
+		std::ifstream in(path, std::ios::binary);
+		if (!in)
+		{
+			this->logerror("ST10: could not open %s\n", path);
+			return image;
+		}
+		in.seekg(0, std::ios::end);
+		std::streamoff const n = in.tellg();
+		if (n <= 0)
+			return image;
+		in.seekg(0);
+		image.resize(size_t(n));
+		in.read(reinterpret_cast<char *>(image.data()), n);
+		image.resize(size_t(in.gcount()));
+		this->logerror("ST10: loaded %s (%u bytes)\n", path, unsigned(image.size()));
+		return image;
+	};
+	std::vector<uint8_t> const internal = load_bin("OPEL_ST10", "CD70_ST10F269_internal.bin");
+	if (!internal.empty())
+		m_gateway->load_internal(internal.data(), uint32_t(internal.size()));
+	std::vector<uint8_t> const external = load_bin("OPEL_ST10_EXT", "CD70_AM29F800BB@TSOP48.BIN");
+	if (!external.empty())
+		m_gateway->load_external(external.data(), uint32_t(external.size()));
+	// Firmware at 02:4E22 spins in JNB P8.0. The pin reads as an input and
+	// nothing else drives it; hold it high as a stand-in for ignition.
+	m_gateway->set_pin(8, 0x0001);
+
 	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&opel_dvd90_state::machine_stop, this));
 
 	save_item(NAME(m_asic_log));
@@ -1631,6 +1845,7 @@ void opel_dvd90_state::machine_reset()
 	m_uart_log = 0;
 	m_timer_pending = 0;
 	m_timer_log = 0;
+	m_sens_irq = 0;
 	m_irq_mask0 = 0;
 	m_irq_mask1 = 0;
 	m_irq_pair = 0;
@@ -1665,6 +1880,9 @@ void opel_dvd90_state::machine_reset()
 	}
 	for (std::string &line : m_uart_line)
 		line.clear();
+	for (std::string &line : m_radio_line)
+		line.clear();
+	m_radio_log = 0;
 	for (std::string &rx : m_uart_rx)
 		rx.clear();
 	m_regs.clear();
@@ -1830,6 +2048,17 @@ void opel_dvd90_state::opel_dvd90(machine_config &config)
 	// Stand-in for the R3900 core. The R3041 is the TLB-less MIPS I device in this
 	// tree; the TX39 behaviour lowboot and the kernel use is enabled on it.
 	// Clock is a guess. Writes complete immediately, so the write buffer is empty.
+	// Crystal beside the TMP92FD54 is 10 MHz. The on-chip doubler makes
+	// fc = 20 MHz (datasheet: 50 ns at fOSC = 10 MHz). CLKMOD is stored
+	// but the gear is not applied, so the core runs at fc from reset.
+	TMP92FD54(config, m_radiocpu, 10_MHz_XTAL * 2);
+	m_radiocpu->tx0_handler().set(FUNC(opel_dvd90_state::radio_tx0));
+	m_radiocpu->tx1_handler().set(FUNC(opel_dvd90_state::radio_tx1));
+
+	// 40 MHz CPU clock, 20 MIPS. ASC0 is the radio SIO1 pair.
+	ST10F269(config, m_gateway, 40_MHz_XTAL);
+	m_gateway->asc_tx_cb().set(FUNC(opel_dvd90_state::gateway_tx));
+
 	R3041(config, m_navcpu, 25_MHz_XTAL);
 	m_navcpu->set_branch_likely(true);
 	m_navcpu->set_no_cache(true);

@@ -591,6 +591,25 @@ if opt_tool(CPUS, "CP1610") then
 end
 
 --------------------------------------------------
+-- Siemens / Infineon C166, ST10F269
+--@src/devices/cpu/c166/st10f269.h,CPUS["C166"] = true
+--------------------------------------------------
+
+if CPUS["C166"] then
+	files {
+		MAME_DIR .. "src/devices/cpu/c166/c166.cpp",
+		MAME_DIR .. "src/devices/cpu/c166/c166.h",
+		MAME_DIR .. "src/devices/cpu/c166/st10f269.cpp",
+		MAME_DIR .. "src/devices/cpu/c166/st10f269.h",
+	}
+end
+
+if opt_tool(CPUS, "C166") then
+	table.insert(disasm_files , MAME_DIR .. "src/devices/cpu/c166/c166dasm.cpp")
+	table.insert(disasm_files , MAME_DIR .. "src/devices/cpu/c166/c166dasm.h")
+end
+
+--------------------------------------------------
 -- Cinematronics vector "CPU"
 --@src/devices/cpu/ccpu/ccpu.h,CPUS["CCPU"] = true
 --------------------------------------------------
@@ -3167,6 +3186,8 @@ if CPUS["TLCS900"] then
 		MAME_DIR .. "src/devices/cpu/tlcs900/tmp95c063.h",
 		MAME_DIR .. "src/devices/cpu/tlcs900/tmp96c141.cpp",
 		MAME_DIR .. "src/devices/cpu/tlcs900/tmp96c141.h",
+		MAME_DIR .. "src/devices/cpu/tlcs900/tmp92fd54.cpp",
+		MAME_DIR .. "src/devices/cpu/tlcs900/tmp92fd54.h",
 	}
 end
 
